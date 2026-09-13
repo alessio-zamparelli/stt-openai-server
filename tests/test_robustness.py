@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import io
 import math
+import threading
 import wave
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -336,3 +337,64 @@ def test_health_reports_robustness_fields():
     assert body["max_upload_mb"] == 7
     assert body["max_audio_seconds"] == 90
     assert body["request_timeout_s"] == 12.5
+
+# --------------------------------------------------------------------------
+# Phase 0 (PLAN-performance.md) — thread-safe inference-pool init
+# --------------------------------------------------------------------------
+
+def test_inference_pool_concurrent_init_returns_same_executor():
+    """16 threads hammering the getter must all see ONE executor (race guard)."""
+    orig = app_module.settings
+    app_module.settings = Settings(idle_unload_s=0, max_concurrent=2)
+    app_module._reset_inference_pool()
+    try:
+        results = []
+
+        def worker():
+            results.append(app_module._inference_pool())
+
+        threads = [threading.Thread(target=worker) for _ in range(16)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert all(r is results[0] for r in results)
+        assert results[0] is not None
+        assert results[0]._max_workers == 2
+    finally:
+        app_module.settings = orig
+        app_module._reset_inference_pool()
+
+
+def test_inference_pool_rebuilt_after_settings_swap():
+    orig = app_module.settings
+    app_module.settings = Settings(idle_unload_s=0, max_concurrent=4)
+    app_module._reset_inference_pool()
+    try:
+        pool = app_module._inference_pool()
+        assert pool is not None
+        assert pool._max_workers == 4
+    finally:
+        app_module.settings = orig
+        app_module._reset_inference_pool()
+
+
+def test_inference_pool_unbounded_returns_none():
+    orig = app_module.settings
+    app_module.settings = Settings(idle_unload_s=0, max_concurrent=0)
+    app_module._reset_inference_pool()
+    try:
+        assert app_module._inference_pool() is None
+    finally:
+        app_module.settings = orig
+        app_module._reset_inference_pool()
+
+
+def test_lifespan_inits_and_resets_pool():
+    model = FakeModel()
+    cfg = Settings(idle_unload_s=0, max_concurrent=2)
+    app_module._reset_inference_pool()
+    with _make_client(_make_store(model), cfg):
+        assert app_module._inference_executor is not None
+        assert app_module._inference_executor._max_workers == 2
+    assert app_module._inference_executor is None  # shutdown resets

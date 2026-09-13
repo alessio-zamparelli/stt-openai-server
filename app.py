@@ -202,8 +202,8 @@ class ModelStore:
                 try:
                     ctypes.CDLL("libc.so.6").malloc_trim(0)
                 except Exception:  # pragma: no cover - non-glibc
-                    pass
-                logger.info(
+                    logger.debug("malloc_trim unavailable on this platform")
+                    logger.info(
                     "idle %.0fs: evicted model to free RAM (unloads=%d)",
                     self._config.idle_unload_s,
                     self.unloads,
@@ -226,6 +226,10 @@ async def lifespan(app: FastAPI):
             f"on {settings.device} ({settings.compute_type})"
         )
 
+    # Eagerly create the bounded inference pool before any request can hit it
+    # (docs/PLAN-performance.md Phase 0: the lazy path can never race).
+    _init_inference_pool()
+
     # RAM-reclamation watchdog: evict the idle model (PLAN-idle-unload.md).
     # Only spawned when eviction is enabled (idle_unload_s > 0). Health probes
     # never call store.touch(), so they don't reset the idle window.
@@ -238,6 +242,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         stop.set()
+        _reset_inference_pool()
 
 
 def _idle_watchdog(stop: threading.Event) -> None:
@@ -524,19 +529,46 @@ def _safe_suffix(filename: Optional[str]) -> str:
 
 
 _inference_executor: Optional[futures.ThreadPoolExecutor] = None
+_inference_pool_lock = threading.Lock()
+
+
+def _build_inference_pool_locked() -> None:
+    """Create the pool from the current settings. Caller must hold the lock."""
+    global _inference_executor
+    if _inference_executor is None and settings.max_concurrent > 0:
+        _inference_executor = futures.ThreadPoolExecutor(
+            max_workers=settings.max_concurrent,
+            thread_name_prefix="whisper-infer",
+        )
+
+
+def _init_inference_pool() -> None:
+    """Eagerly create the bounded pool at startup (event loop is single-threaded)."""
+    with _inference_pool_lock:
+        _build_inference_pool_locked()
+
+
+def _reset_inference_pool() -> None:
+    """Close and drop the pool so it can be rebuilt at a new max_concurrent."""
+    global _inference_executor
+    with _inference_pool_lock:
+        if _inference_executor is not None:
+            _inference_executor.shutdown(wait=False)
+            _inference_executor = None
 
 
 def _inference_pool() -> Optional[futures.ThreadPoolExecutor]:
-    """Bounded worker pool for inference (None -> anyio pool, unbounded)."""
-    global _inference_executor
-    if settings.max_concurrent > 0:
-        if _inference_executor is None:
-            _inference_executor = futures.ThreadPoolExecutor(
-                max_workers=settings.max_concurrent,
-                thread_name_prefix="whisper-infer",
-            )
-        return _inference_executor
-    return None
+    """Bounded worker pool for inference (None -> anyio pool, unbounded).
+
+    Double-checked locking: safe even if a future caller invokes this off the
+    event loop (docs/PLAN-performance.md Phase 0). ``_init_inference_pool()``
+    warms it at startup, so the lock path is effectively never taken in
+    production.
+    """
+    if _inference_executor is None:
+        with _inference_pool_lock:
+            _build_inference_pool_locked()
+    return _inference_executor
 
 
 async def _offload(fn: Callable, *args) -> Any:
@@ -605,7 +637,7 @@ def _audio_duration_s(path: str) -> Optional[float]:
         finally:
             container.close()
     except Exception:
-        pass
+        logger.debug("duration probe failed for %s", path, exc_info=True)
     return None
 
 
@@ -743,7 +775,7 @@ async def _sse_stream(wm: Any, path: str, kwargs: dict, task: str):
         try:
             os.unlink(path)
         except OSError:
-            pass
+            logger.debug("temp file already gone on stream drain: %s", path)
 
 
 # ---------------------------------------------------------------------------
@@ -884,7 +916,7 @@ async def transcribe_audio(
             try:
                 os.unlink(tmp_path)
             except OSError:
-                pass
+                logger.debug("temp file already gone (transcribe): %s", tmp_path)
 
 
 @app.post("/v1/audio/translations")
@@ -965,7 +997,7 @@ async def translate_audio(
             try:
                 os.unlink(tmp_path)
             except OSError:
-                pass
+                logger.debug("temp file already gone (translate): %s", tmp_path)
 
 
 # ---------------------------------------------------------------------------
