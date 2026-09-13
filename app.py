@@ -55,6 +55,12 @@ class Settings(BaseModel):
     max_upload_mb: int = 100  # WHISPER_MAX_UPLOAD_MB (0 = unlimited)
     max_audio_seconds: int = 3600  # WHISPER_MAX_AUDIO_SECONDS (0 = off)
     request_timeout_s: float = 300.0  # WHISPER_REQUEST_TIMEOUT_S (0 = off)
+    # Inference tuning (docs/PLAN-performance.md Phase 1). Accuracy-first
+    # defaults; the knobs exist for latency-sensitive deployments.
+    beam_size: int = 5  # WHISPER_BEAM_SIZE
+    best_of: int = 5  # WHISPER_BEST_OF
+    temperature_schedule: str = ""  # WHISPER_TEMPERATURES e.g. "0,0.2,0.4" ("" = fw default)
+    cpu_threads: int = 0  # WHISPER_CPU_THREADS (0 = faster-whisper default)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -96,6 +102,10 @@ settings = Settings(
     max_upload_mb=_env_int("WHISPER_MAX_UPLOAD_MB", 100),
     max_audio_seconds=_env_int("WHISPER_MAX_AUDIO_SECONDS", 3600),
     request_timeout_s=_env_float("WHISPER_REQUEST_TIMEOUT_S", 300.0),
+    beam_size=_env_int("WHISPER_BEAM_SIZE", 5),
+    best_of=_env_int("WHISPER_BEST_OF", 5),
+    temperature_schedule=os.getenv("WHISPER_TEMPERATURES", "").strip(),
+    cpu_threads=_env_int("WHISPER_CPU_THREADS", 0),
 )
 
 
@@ -116,6 +126,7 @@ def _load_model():
         settings.model_name,
         device=settings.device,
         compute_type=settings.compute_type,
+        cpu_threads=settings.cpu_threads,
     )
 
 
@@ -686,6 +697,23 @@ def _segment_dict(seg) -> dict:
     }
 
 
+def _parse_temperatures(raw: Optional[str]) -> Optional[list]:
+    """Parse WHISPER_TEMPERATURES ('0,0.2,0.4') -> [0.0, 0.2, 0.4]; None = default.
+
+    Bad input falls back to the faster-whisper default schedule rather than
+    failing startup or reverting to a single pass.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        vals = [float(v) for v in raw.split(",") if v.strip()]
+    except ValueError:
+        logger.warning("ignoring bad WHISPER_TEMPERATURES=%r", raw)
+        return None
+    return vals or None
+
+
 def _build_kwargs(
     language: Optional[str],
     prompt: Optional[str],
@@ -694,11 +722,16 @@ def _build_kwargs(
 ) -> dict:
     """Shared transcription kwargs (single source of truth for both endpoints)."""
     kwargs: dict = {
-        "beam_size": 5,
-        "best_of": 5,
+        "beam_size": settings.beam_size,
+        "best_of": settings.best_of,
         "condition_on_previous_text": False,
         "temperature": temperature if temperature is not None else 0.0,
     }
+    # A server-wide fallback schedule (WHISPER_TEMPERATURES) replaces the
+    # per-request scalar when set — documented tradeoff, PLAN-performance 1B.
+    schedule = _parse_temperatures(settings.temperature_schedule)
+    if schedule:
+        kwargs["temperature"] = schedule
     if task:
         kwargs["task"] = task
     if language:
@@ -822,6 +855,10 @@ async def health():
         "max_upload_mb": settings.max_upload_mb,
         "max_audio_seconds": settings.max_audio_seconds,
         "request_timeout_s": settings.request_timeout_s,
+        "beam_size": settings.beam_size,
+        "best_of": settings.best_of,
+        "temperature_schedule": settings.temperature_schedule or None,
+        "cpu_threads": settings.cpu_threads,
     }
 
 

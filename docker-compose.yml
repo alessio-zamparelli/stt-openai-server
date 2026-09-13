@@ -47,6 +47,14 @@ services:
       # - WHISPER_MAX_AUDIO_SECONDS=3600
       # Abandon-the-call timeout in seconds -> 504 (0=off).
       # - WHISPER_REQUEST_TIMEOUT_S=300
+      # Latency tuning (see README "Latency tuning"): accuracy-first defaults;
+      # enable only for latency-sensitive workloads (beam2 parity is run-dependent).
+      # - WHISPER_BEAM_SIZE=5
+      # - WHISPER_BEST_OF=5
+      # Trimmed fallback temperature schedule (overrides request temperature).
+      # - WHISPER_TEMPERATURES=0,0.2,0.4
+      # CT2 intra-op threads; rule of thumb: cores / WHISPER_MAX_CONCURRENT.
+      # - WHISPER_CPU_THREADS=2
     volumes:
       # Persistent model weights across restarts (HF_HOME=/data/hf).
       - whisper-data:/data

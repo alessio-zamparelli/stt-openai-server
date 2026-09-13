@@ -295,3 +295,10 @@ knobs, and both suites. Phases stay individually green and ship separately.
 - **Batched × threads × concurrent** is a 3-dimensional CPU budget; the README
   example in Phase 3G is the guardrail, and `/health` stage timings (F) are
   the feedback loop.
+
+## Implementation status
+
+- **Phase 0** ✅ `bfb4f13` — thread-safe inference-pool init (eager lifespan init, double-checked lock, `_reset_inference_pool`), 5 RED empty-except fixes, plan doc.
+- **Phase 1** ✅ — `WHISPER_BEAM_SIZE`/`WHISPER_BEST_OF`/`WHISPER_TEMPERATURES`/`WHISPER_CPU_THREADS` env knobs + `_parse_temperatures` + `_build_kwargs`/loader forwarding + `/health` reporting; 14 unit + 4 e2e tests. **Accuracy gate: FAIL to flip** — jfk + Italian TTS clips showed beam2 parity is *run-dependent* (jfk/buongiorno/stazione passed, `grazie mille per il tuo aiuto` degraded to `per il tuo aiuto` on one utterance; one run also drifted on ciao + stazione). Defaults stay `beam=5/best=5`; knobs are opt-in. README latency-tuning table + env rows, compose knob comments.
+- **Phase 2** 🔜 — `WHISPER_BATCH_SIZE` (BatchedInferencePipeline, opt-in) + e2e `< 0.75×` sequential baseline.
+- **Phase 3** 🔜 — `WHISPER_VAD`, `WHISPER_HF_OFFLINE`, per-stage `latency_ms` at `/health`, README presets table + compose preset blocks, ops runbook, drift-guard test.
