@@ -57,6 +57,17 @@ services:
       # - WHISPER_CPU_THREADS=2
       # Batch whisper's ~30 s windows (opt-in; batched ignores condition_on_previous_text).
       # - WHISPER_BATCH_SIZE=4
+      # VAD pre-filter (sparse/quiet audio; net cost on all-speech clips).
+      # - WHISPER_VAD=true
+      # Offline mode: local_files_only=True, never touch the HF hub.
+      # - WHISPER_HF_OFFLINE=true
+      # --- Presets (README "Reproduce the measured baseline") ---
+      # Enable one preset at a time (tokens below are drift-guarded by tests):
+      #   beam2 (≈2x):          WHISPER_BEAM_SIZE=2 WHISPER_BEST_OF=2
+      #   trimmed schedule:     WHISPER_TEMPERATURES=0,0.2,0.4
+      #   batched (≈4.3x):      WHISPER_BATCH_SIZE=4
+      #   VAD (cost on dense audio): WHISPER_VAD=true
+      #   cpu_threads=2:        WHISPER_CPU_THREADS=2
     volumes:
       # Persistent model weights across restarts (HF_HOME=/data/hf).
       - whisper-data:/data

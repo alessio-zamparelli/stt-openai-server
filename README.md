@@ -174,6 +174,8 @@ print(result.text)
 | `WHISPER_TEMPERATURES` | *(fw default)* | Comma-separated fallback schedule, e.g. `0,0.2,0.4`. Trims whisper's default `[0…1.0]` ramp (a hidden multiplier) and overrides the per-request `temperature` scalar when set. Bad values fall back to the default schedule (no 500) |
 | `WHISPER_CPU_THREADS` | *(fw default)* | CT2 intra-op threads. `0` = faster-whisper default. Rule of thumb: `cores / WHISPER_MAX_CONCURRENT` — don't oversubscribe |
 | `WHISPER_BATCH_SIZE` | `0` | `>0` batches whisper's ~30 s windows with `BatchedInferencePipeline` (~3–4× on multi-window audio). Opt-in: batched mode ignores `condition_on_previous_text`, so casing/segmentation can drift. Best used together with beam/temperature tuning |
+| `WHISPER_VAD` | `false` | Pre-filter silence with Silero-VAD before transcription. Helps sparse / quiet audio; on all-speech clips it is a *net cost* (adds a full VAD pass). |
+| `WHISPER_HF_OFFLINE` | `false` | Load the model with `local_files_only=True` — never touch the Hugging Face hub (no revalidation round-trips). Fails fast if weights aren't already in `HF_HOME` |
 | `HF_HOME` | `/data/hf` (container) | Where model weights are downloaded/cached |
 
 > 💡 **Priority for `language`**: per-request `language` field → `WHISPER_LANGUAGE`
@@ -202,6 +204,27 @@ degraded to `per il tuo aiuto` on one utterance — so the server ships `beam=5/
 by default and these knobs are **opt-in** for latency-sensitive workloads. Treat the
 numbers as *ratios*, not absolutes: machine variance is large, re-measure on your own
 hardware.
+
+### 🧪 Reproduce the measured baseline
+
+Each preset row maps 1:1 to a commented env block in `docker-compose.yml` (enable one
+row at a time). A drift-guard test (`tests/test_plan_docs.py`) asserts every knob in
+this table also appears in the configuration table above *and* in the compose file.
+
+| Preset | Env | vs. default (`base`/int8, CPU, 33 s clip) |
+| --- | --- | --- |
+| default (accuracy-first) | *(none — server defaults)* | baseline 8.35 s |
+| beam2 | `WHISPER_BEAM_SIZE=2 WHISPER_BEST_OF=2` | ≈2× faster |
+| beam2 + trimmed schedule | + `WHISPER_TEMPERATURES=0,0.2,0.4` | ≈2.8× faster |
+| batched | + `WHISPER_BATCH_SIZE=4` | ≈4.3× faster |
+| VAD | + `WHISPER_VAD=true` | *cost* on all-speech clips¹ |
+| `cpu_threads` | `WHISPER_CPU_THREADS=1/2/4` | saturates ≈ cores |
+
+¹ VAD pre-filtering helps sparse or quiet audio (long pauses) but adds a full VAD
+pass — on dense speech it is a penalty, not a win. ² Presets are independent knobs;
+`batch_size` applies at the *window* level so its `~4.3×` gain compounds on
+multi-window clips. Beam2 parity is run-dependent (above); validating on your own
+corpus before shipping is the standing caveat.
 
 ### Why `base` + `int8`?
 
@@ -271,6 +294,7 @@ Measured against real TTS clips (0.3–2 s), the biggest accuracy lever is
 - **Healthcheck** — built-in `HEALTHCHECK` hits `/health` every 30 s
 - **Non-root** — container runs as uid `10001`
 - **Scaling** — the model is loaded per process; scale horizontally with `docker compose --scale whisper=N` behind a reverse proxy
+- **One resident model per host** — each loaded `base`/int8 model holds ~450 MB RAM and holds the CT2 thread pool for its whole request; running several whisper containers on one box so **cold-start contention of 3–4 s per load plus per-request thread-saturation is an ops problem, not a server one**. Prefer fewer, larger instances (or batching) over many small ones, and size `WHISPER_MAX_CONCURRENT` × `WHISPER_CPU_THREADS` ≤ cores. See [Latency tuning](#latency-tuning) for the measured baseline/probes and [PLAN-performance](docs/PLAN-performance.md) for the per-stage timings exposed at `/health`
 - **Provenance** — published images carry SLSA build attestations
 - **Security** — no API key enforcement is built in; put an auth proxy (e.g. Traefik forward-auth, nginx) in front for public deployments
 

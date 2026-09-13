@@ -75,6 +75,50 @@ def client_batched(server_batched):
         yield c
 
 
+# ---------------------------------------------------------------------------
+# Phase 3 — offline mode (WHISPER_HF_OFFLINE) + VAD knob knob reported
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="session")
+def server_offline(tmp_path_factory):
+    """local_files_only=True + HF_HUB_OFFLINE=1: no HF hub round-trip."""
+    with _server(
+        tmp_path_factory,
+        {"WHISPER_HF_OFFLINE": "true", "HF_HUB_OFFLINE": "1"},
+    ) as url:
+        yield url
+
+
+@pytest.fixture(scope="session")
+def client_offline(server_offline):
+    with httpx.Client(base_url=server_offline, timeout=300.0) as c:
+        yield c
+
+
+def test_offline_mode_no_hub_roundtrip(client_offline, speech_sample):
+    """With the model cached, offline mode must transcribe without touching
+    the HF hub (would fail hard if weights were absent)."""
+    sample, is_speech = speech_sample
+    if not is_speech:
+        pytest.skip("no real speech sample")
+    with open(sample, "rb") as f:
+        r = client_offline.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("jfk.flac", f, "audio/flac")},
+            data={"model": "whisper-1"},
+        )
+    assert r.status_code == 200
+    assert "my fellow americans" in r.json()["text"].lower()
+
+
+def test_offline_health_reports_offline(client_offline):
+    body = client_offline.get("/health").json()
+    assert body["hf_offline"] is True
+    assert body["vad_filter"] is False
+    assert "latency_ms" in body
+    assert isinstance(body["latency_ms"], dict)
+
+
 def test_tuned_server_transcribes_jfk_without_loops(client_tuned, speech_sample):
     sample, is_speech = speech_sample
     with open(sample, "rb") as f:

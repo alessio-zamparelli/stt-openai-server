@@ -16,6 +16,7 @@ import queue
 import tempfile
 import threading
 import time
+from collections import defaultdict, deque
 from concurrent import futures
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -62,6 +63,8 @@ class Settings(BaseModel):
     temperature_schedule: str = ""  # WHISPER_TEMPERATURES e.g. "0,0.2,0.4" ("" = fw default)
     cpu_threads: int = 0  # WHISPER_CPU_THREADS (0 = faster-whisper default)
     batch_size: int = 0  # WHISPER_BATCH_SIZE (0 = sequential; >0 = batched pipeline)
+    vad_filter: bool = False  # WHISPER_VAD (enable VAD pre-filtering at transcribe time)
+    hf_offline: bool = False  # WHISPER_HF_OFFLINE (local_files_only on model load)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -108,6 +111,8 @@ settings = Settings(
     temperature_schedule=os.getenv("WHISPER_TEMPERATURES", "").strip(),
     cpu_threads=_env_int("WHISPER_CPU_THREADS", 0),
     batch_size=_env_int("WHISPER_BATCH_SIZE", 0),
+    vad_filter=_env_bool("WHISPER_VAD", False),
+    hf_offline=_env_bool("WHISPER_HF_OFFLINE", False),
 )
 
 
@@ -129,6 +134,7 @@ def _load_model():
         device=settings.device,
         compute_type=settings.compute_type,
         cpu_threads=settings.cpu_threads,
+        local_files_only=settings.hf_offline,  # offline: never hit the HF hub
     )
 
 
@@ -584,6 +590,46 @@ def _inference_pool() -> Optional[futures.ThreadPoolExecutor]:
     return _inference_executor
 
 
+# ---------------------------------------------------------------------------
+# Rolling stage timings (upload / duration / language / inference / total)
+# ---------------------------------------------------------------------------
+# Circular buffers of millisecond samples per stage; /health reports rolling
+# p50/p95 so operators can see where latency goes without a metrics agent.
+# Thread-safe: route coroutines and worker threads may record concurrently.
+_STAGE_WINDOW = 200
+_stage_samples: dict = defaultdict(deque)
+_timings_lock = threading.Lock()
+
+
+def _record_stage(stage: str, seconds: float) -> None:
+    with _timings_lock:
+        buf = _stage_samples[stage]
+        buf.append(seconds * 1000.0)
+        if len(buf) > _STAGE_WINDOW:
+            buf.popleft()
+
+
+def _percentile_sorted_ms(vals: list, pct: float) -> float:
+    """Nearest-rank percentile of an already-sorted sample list (ms)."""
+    if not vals:
+        return 0.0
+    idx = round((len(vals) - 1) * pct)  # round() returns an int index
+    return round(vals[idx], 1)
+
+
+def _stage_stats() -> dict:
+    with _timings_lock:
+        out = {}
+        for stage, buf in _stage_samples.items():
+            vals = sorted(buf)
+            out[stage] = {
+                "n": len(vals),
+                "p50_ms": _percentile_sorted_ms(vals, 0.5),
+                "p95_ms": _percentile_sorted_ms(vals, 0.95),
+            }
+        return out
+
+
 async def _offload(fn: Callable, *args) -> Any:
     """Run a blocking chunk off the event loop (CTranslate2 releases the GIL).
 
@@ -737,6 +783,8 @@ def _build_kwargs(
         kwargs["temperature"] = schedule
     if batched:
         kwargs["batch_size"] = settings.batch_size
+    if settings.vad_filter:
+        kwargs["vad_filter"] = True
     if task:
         kwargs["task"] = task
     if language:
@@ -880,6 +928,9 @@ async def health():
         "temperature_schedule": settings.temperature_schedule or None,
         "cpu_threads": settings.cpu_threads,
         "batch_size": settings.batch_size,
+        "vad_filter": settings.vad_filter,
+        "hf_offline": settings.hf_offline,
+        "latency_ms": _stage_stats(),
     }
 
 
@@ -906,6 +957,7 @@ async def transcribe_audio(
     fmt = _validate_response_format(response_format)
     limit = _upload_limit()
     _check_content_length(request.headers.get("content-length"), limit)
+    _t_route = time.perf_counter()
 
     # Record real API demand (never /health), then capture the model into a
     # local ref so a concurrent idle-eviction can't tear it down mid-request.
@@ -918,18 +970,24 @@ async def transcribe_audio(
         #    under a sanitized extension that mirrors the real upload. PyAV
         #    sniffs the bytes, so the extension is hygiene, not logic.
         suffix = _safe_suffix(file.filename)
+        _t_up = time.perf_counter()
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             await _write_upload(file, tmp, limit)
             tmp_path = tmp.name
+        _record_stage("upload", time.perf_counter() - _t_up)
 
         # 2. Reject audio longer than the cap before touching the model.
+        _t_dur = time.perf_counter()
         await _guard_duration_ok(tmp_path)
+        _record_stage("duration", time.perf_counter() - _t_dur)
 
         # 3. Build transcription kwargs. Client `language` wins; otherwise
         #    server defaults/allowlist apply. Client `prompt` wins; otherwise
         #    a server-wide initial prompt applies. faster-whisper names the
         #    prompt kwarg `initial_prompt` (OpenAI calls it `prompt`).
+        _t_lang = time.perf_counter()
         resolved_language = await _offload(_resolve_language, wm, tmp_path, language)
+        _record_stage("language", time.perf_counter() - _t_lang)
         resolved_prompt = prompt or settings.initial_prompt
         runner = _build_runner(wm)
         kwargs = _build_kwargs(
@@ -948,10 +1006,12 @@ async def transcribe_audio(
                 headers={"Cache-Control": "no-cache"},
             )
 
+        _t_inf = time.perf_counter()
         segment_list, info, full_text = await _maybe_timeout(
             _offload(_transcribe_collect, runner, tmp_path, kwargs),
             settings.request_timeout_s,
         )
+        _record_stage("inference", time.perf_counter() - _t_inf)
 
         # 5. Plain-text / subtitle formats return the document itself (OpenAI style)
         if fmt in ("txt", "srt", "vtt"):
@@ -970,6 +1030,9 @@ async def transcribe_audio(
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
+        # Rolling p50/p95 stage timings; stream paths record setup stages only
+        # (inference finishes after the streaming response returns).
+        _record_stage("total", time.perf_counter() - _t_route)
         # For stream=true the temp file is owned by _sse_stream (which unlinks it
         # after draining); here we only clean up the non-streaming path.
         if tmp_path and not stream:
@@ -998,6 +1061,7 @@ async def translate_audio(
     fmt = _validate_response_format(response_format)
     limit = _upload_limit()
     _check_content_length(request.headers.get("content-length"), limit)
+    _t_route = time.perf_counter()
 
     # Record real API demand (never /health), then capture the model into a
     # local ref so a concurrent idle-eviction can't tear it down mid-request.
@@ -1006,16 +1070,22 @@ async def translate_audio(
 
     tmp_path: Optional[str] = None
     try:
+        _t_up = time.perf_counter()
         suffix = _safe_suffix(file.filename)
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             await _write_upload(file, tmp, limit)
             tmp_path = tmp.name
+        _record_stage("upload", time.perf_counter() - _t_up)
 
+        _t_dur = time.perf_counter()
         await _guard_duration_ok(tmp_path)
+        _record_stage("duration", time.perf_counter() - _t_dur)
 
         # Server defaults/allowlist steer source-language detection
         # (OpenAI's translations endpoint always translates *to* English).
+        _t_lang = time.perf_counter()
         resolved_language = await _offload(_resolve_language, wm, tmp_path, None)
+        _record_stage("language", time.perf_counter() - _t_lang)
         resolved_prompt = prompt or settings.initial_prompt
         runner = _build_runner(wm)
         kwargs = _build_kwargs(
@@ -1033,10 +1103,12 @@ async def translate_audio(
                 headers={"Cache-Control": "no-cache"},
             )
 
+        _t_inf = time.perf_counter()
         segment_list, info, full_text = await _maybe_timeout(
             _offload(_transcribe_collect, runner, tmp_path, kwargs),
             settings.request_timeout_s,
         )
+        _record_stage("inference", time.perf_counter() - _t_inf)
 
         if fmt in ("txt", "srt", "vtt"):
             return _text_response(fmt, segment_list, full_text)
@@ -1054,6 +1126,8 @@ async def translate_audio(
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
+        # Rolling p50/p95 stage timings; stream paths record setup stages only.
+        _record_stage("total", time.perf_counter() - _t_route)
         # stream=true -> _sse_stream owns cleanup of the temp file.
         if tmp_path and not stream:
             try:
