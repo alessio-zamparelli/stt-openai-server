@@ -27,6 +27,15 @@ services:
       # - WHISPER_IDLE_UNLOAD_S=300
       # How often the watchdog checks the idle window (seconds).
       # - WHISPER_IDLE_POLL_S=30
+      # Default language used when a request omits `language` (ISO-639-1 code;
+      # unset = auto-detect). Pinning helps short clips: e.g. WHISPER_LANGUAGE=it
+      # - WHISPER_LANGUAGE=it
+      # Comma-separated allowlist for auto-detection, e.g. detect only among
+      # italian/english. A single code forces it (no detection at all); several
+      # codes run a detection constrained to that set.
+      # - WHISPER_LANGUAGES=it,en
+      # Prompt applied whenever a request doesn't send one (conditions decode).
+      # - WHISPER_INITIAL_PROMPT=The transcript is:
     volumes:
       # Persistent model weights across restarts (HF_HOME=/data/hf).
       - whisper-data:/data

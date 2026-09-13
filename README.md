@@ -162,7 +162,14 @@ print(result.text)
 | `WHISPER_LAZY_LOAD` | `false` | Defer model load until the first request |
 | `WHISPER_IDLE_UNLOAD_S` | `300` | Evict the model from RAM after this many seconds with no API requests (`0` disables; next request reloads it ~0.5s warm). See [Idle memory](/docs/PLAN-idle-unload.md) |
 | `WHISPER_IDLE_POLL_S` | `30` | How often the watchdog re-checks the idle window |
+| `WHISPER_LANGUAGE` | *(auto)* | Default language when a request omits `language` (ISO-639-1 code, e.g. `it`). Pinning stabilizes short / low-quality clips |
+| `WHISPER_LANGUAGES` | *(auto)* | Comma-separated allowlist, e.g. `it,en`. A single code is forced for every request; several codes run auto-detection *constrained* to that set (whisper's default detection ignores any allowlist) |
+| `WHISPER_INITIAL_PROMPT` | *(none)* | Prompt applied whenever a request sends none (conditions the decoder, e.g. `The transcript is:`) |
 | `HF_HOME` | `/data/hf` (container) | Where model weights are downloaded/cached |
+
+> 💡 **Priority for `language`**: per-request `language` field → `WHISPER_LANGUAGE`
+> → `WHISPER_LANGUAGES` (single forced / multi constrained-detect) → faster-whisper
+> full auto-detect.
 
 > 📌 The `model` field in requests is accepted for OpenAI compatibility but
 > ignored — the server always serves the configured model.
@@ -180,6 +187,27 @@ print(result.text)
 `base` is the sweet spot for CPU serving: good accuracy across languages at a
 fraction of the footprint, and `int8` roughly halves memory again with ~2×
 speedup over fp32 (via FBGEMM on x86 / AVX2).
+
+### 🎯 Getting accurate transcriptions (short audio)
+
+Measured against real TTS clips (0.3–2 s), the biggest accuracy lever is
+**audio length, not model size**:
+
+- **Pin the language.** `language="it"` / `WHISPER_LANGUAGE=it` reliably beats
+  auto-detect on short clips (auto-language-ID misfires below ~1 s). A
+  multilingual deployment can restrict detection with `WHISPER_LANGUAGES=it,en`.
+- **Longer utterances transcribe much better.** Isolated words were
+  ~30–60% exact over repeated trials; full sentences/phrases hit ~100% on the
+  same `base` model. If you control input, transcribe a longer span.
+- **Model size fixes the failure *mode*, not the floor.** `base` falls into
+  repetition loops ("non si si si…") on sub-second clips; `small`/`medium`
+  avoid that and nailed clean words, but none of them recover a 0.2 s clip.
+- **"The user says:" as a text prompt hurts** (it conditions on mismatched
+  context, often yielding empty output). Spoken carrier-sentence context
+  (TTS reads "l'utente dice forse") *does* help — but only when it genuinely
+  lengthens the audio, which TTS compressors often refuse to do.
+- Speed-stretching the clip (`atempo 0.8`) was a wash (~−8% net) once TTS
+  clip variance is averaged in.
 
 ## 🏗️ Architecture
 

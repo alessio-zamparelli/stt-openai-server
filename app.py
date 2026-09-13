@@ -38,6 +38,12 @@ class Settings(BaseModel):
     lazy_load: bool = False
     idle_unload_s: int = 300  # evict the model to free RAM after this much idle; 0 = off
     idle_poll_s: int = 30  # watchdog cadence (only when idle_unload_s > 0)
+    # Language handling. Priority per request: client `language` field, then
+    # `default_language`, then (with a multi-code `allowed_languages`) a
+    # detection constrained to the allowlist, then faster-whisper full auto.
+    default_language: Optional[str] = None  # WHISPER_LANGUAGE
+    allowed_languages: Optional[str] = None  # WHISPER_LANGUAGES  e.g. "it,en"
+    initial_prompt: Optional[str] = None  # WHISPER_INITIAL_PROMPT
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -64,6 +70,9 @@ settings = Settings(
     lazy_load=_env_bool("WHISPER_LAZY_LOAD", False),
     idle_unload_s=_env_int("WHISPER_IDLE_UNLOAD_S", 300),
     idle_poll_s=_env_int("WHISPER_IDLE_POLL_S", 30),
+    default_language=os.getenv("WHISPER_LANGUAGE") or None,
+    allowed_languages=os.getenv("WHISPER_LANGUAGES") or None,
+    initial_prompt=os.getenv("WHISPER_INITIAL_PROMPT") or None,
 )
 
 
@@ -387,6 +396,82 @@ def _validate_response_format(response_format: Optional[str]) -> str:
     return fmt
 
 
+def _split_allowed_languages(raw: Optional[str]) -> List[str]:
+    """Parse a WHISPER_LANGUAGES value like 'it, en' -> ['it', 'en']."""
+    if not raw:
+        return []
+    return [code.strip().lower() for code in raw.split(",") if code.strip()]
+
+
+def _supported_language_codes(model: Any) -> Optional[set]:
+    """Whisper's supported ISO codes for a model (None when unavailable)."""
+    codes = getattr(model, "supported_languages", None)
+    return set(codes) if codes else None
+
+
+def _check_language(code: Optional[str], supported: Optional[set]) -> Optional[str]:
+    """Normalize/validate an ISO code, raising a clear 400 on bad values."""
+    if not code:
+        return None
+    code = code.strip().lower()
+    if not code:  # whitespace-only counts as "no preference", like an empty field
+        return None
+    if supported and code not in supported:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported language {code!r}. Supported: {sorted(supported)}. "
+                "Pass an ISO-639-1 code such as 'en' or 'it'."
+            ),
+        )
+    return code
+
+
+def _resolve_language(model: Any, audio_path: str, requested: Optional[str]) -> Optional[str]:
+    """Resolve the `language` hint forwarded to faster-whisper.
+
+    Priority:
+      1. The client's `language` field (explicit override; an empty or
+         whitespace-only value is treated as absent and falls through).
+      2. Server default  WHISPER_LANGUAGE.
+      3. WHISPER_LANGUAGES allowlist:
+         - a single code is used verbatim;
+         - several codes enable *constrained* detection: run faster-whisper's
+           language detector, then pick the highest-probability *allowed* code
+           (plain auto-detect ignores the allowlist entirely).
+      4. None -> faster-whisper full auto-detect.
+    """
+    supported = _supported_language_codes(model)
+
+    if requested is not None:
+        checked = _check_language(requested, supported)
+        if checked:  # empty/whitespace-only -> absent, fall through to defaults
+            return checked
+    if settings.default_language:
+        return _check_language(settings.default_language, supported)
+
+    allowed = _split_allowed_languages(settings.allowed_languages)
+    if len(allowed) == 1:
+        return _check_language(allowed[0], supported)
+    if len(allowed) > 1:
+        # Validate the whole allowlist up front for a clear 400.
+        for code in allowed:
+            _check_language(code, supported)
+        # Constrained detection needs decoded audio; faster-whisper returns the
+        # full ranked list, so we can ignore every code outside the allowlist.
+        from faster_whisper.audio import decode_audio
+
+        audio = decode_audio(audio_path)
+        _code, _prob, all_scores = model.detect_language(audio)
+        best: Optional[tuple] = None
+        for code, prob in all_scores:
+            candidate = code.strip().lower()
+            if candidate in allowed and (best is None or prob > best[1]):
+                best = (candidate, prob)
+        return best[0] if best else None
+    return None
+
+
 def _text_response(fmt: str, segment_list, full_text: str) -> PlainTextResponse:
     """Return plain-text / subtitle responses, OpenAI style."""
     if fmt == "txt":
@@ -434,6 +519,8 @@ async def health():
         "last_request_age_s": round(store.last_request_age(), 1),
         "unloads": store.unloads,
         "reloads": store.reloads,
+        "default_language": settings.default_language,
+        "allowed_languages": settings.allowed_languages,
     }
 
 
@@ -476,10 +563,15 @@ async def transcribe_audio(
             "condition_on_previous_text": False,
             "temperature": temperature if temperature is not None else 0.0,
         }
-        if language:
-            kwargs["language"] = language
-        if prompt:
-            kwargs["prompt"] = prompt
+        # Client `language` wins; otherwise server defaults/allowlist apply.
+        resolved_language = _resolve_language(wm, tmp_path, language)
+        if resolved_language:
+            kwargs["language"] = resolved_language
+        # Client `prompt` wins; otherwise a server-wide initial prompt applies.
+        # faster-whisper names this kwarg `initial_prompt` (OpenAI calls it `prompt`).
+        resolved_prompt = prompt or settings.initial_prompt
+        if resolved_prompt:
+            kwargs["initial_prompt"] = resolved_prompt
 
         # 3. Run inference
         segments, info = wm.transcribe(tmp_path, **kwargs)
@@ -562,8 +654,14 @@ async def translate_audio(
             "temperature": temperature if temperature is not None else 0.0,
             "task": "translate",
         }
-        if prompt:
-            kwargs["prompt"] = prompt
+        # Server defaults/allowlist steer source-language detection
+        # (OpenAI's translations endpoint always translates *to* English).
+        resolved_language = _resolve_language(wm, tmp_path, None)
+        if resolved_language:
+            kwargs["language"] = resolved_language
+        resolved_prompt = prompt or settings.initial_prompt
+        if resolved_prompt:
+            kwargs["initial_prompt"] = resolved_prompt
 
         segments, info = wm.transcribe(tmp_path, **kwargs)
 
