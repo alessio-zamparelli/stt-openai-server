@@ -173,6 +173,7 @@ print(result.text)
 | `WHISPER_BEST_OF` | `5` | Candidates sampled when `temperature > 0`. Pair with `WHISPER_BEAM_SIZE` for latency tuning |
 | `WHISPER_TEMPERATURES` | *(fw default)* | Comma-separated fallback schedule, e.g. `0,0.2,0.4`. Trims whisper's default `[0…1.0]` ramp (a hidden multiplier) and overrides the per-request `temperature` scalar when set. Bad values fall back to the default schedule (no 500) |
 | `WHISPER_CPU_THREADS` | *(fw default)* | CT2 intra-op threads. `0` = faster-whisper default. Rule of thumb: `cores / WHISPER_MAX_CONCURRENT` — don't oversubscribe |
+| `WHISPER_BATCH_SIZE` | `0` | `>0` batches whisper's ~30 s windows with `BatchedInferencePipeline` (~3–4× on multi-window audio). Opt-in: batched mode ignores `condition_on_previous_text`, so casing/segmentation can drift. Best used together with beam/temperature tuning |
 | `HF_HOME` | `/data/hf` (container) | Where model weights are downloaded/cached |
 
 > 💡 **Priority for `language`**: per-request `language` field → `WHISPER_LANGUAGE`

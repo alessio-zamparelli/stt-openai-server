@@ -61,6 +61,7 @@ class Settings(BaseModel):
     best_of: int = 5  # WHISPER_BEST_OF
     temperature_schedule: str = ""  # WHISPER_TEMPERATURES e.g. "0,0.2,0.4" ("" = fw default)
     cpu_threads: int = 0  # WHISPER_CPU_THREADS (0 = faster-whisper default)
+    batch_size: int = 0  # WHISPER_BATCH_SIZE (0 = sequential; >0 = batched pipeline)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -106,6 +107,7 @@ settings = Settings(
     best_of=_env_int("WHISPER_BEST_OF", 5),
     temperature_schedule=os.getenv("WHISPER_TEMPERATURES", "").strip(),
     cpu_threads=_env_int("WHISPER_CPU_THREADS", 0),
+    batch_size=_env_int("WHISPER_BATCH_SIZE", 0),
 )
 
 
@@ -719,6 +721,7 @@ def _build_kwargs(
     prompt: Optional[str],
     temperature: float,
     task: Optional[str] = None,
+    batched: bool = False,
 ) -> dict:
     """Shared transcription kwargs (single source of truth for both endpoints)."""
     kwargs: dict = {
@@ -732,6 +735,8 @@ def _build_kwargs(
     schedule = _parse_temperatures(settings.temperature_schedule)
     if schedule:
         kwargs["temperature"] = schedule
+    if batched:
+        kwargs["batch_size"] = settings.batch_size
     if task:
         kwargs["task"] = task
     if language:
@@ -741,9 +746,24 @@ def _build_kwargs(
     return kwargs
 
 
-def _transcribe_collect(wm: Any, path: str, kwargs: dict) -> tuple:
+def _build_runner(wm: Any) -> Any:
+    """Model or opt-in BatchedInferencePipeline wrapper (WHISPER_BATCH_SIZE > 0).
+
+    Batched mode chunks the ~30 s windows itself and does not support
+    condition_on_previous_text, so it can change segmentation/casing — strict
+    opt-in (docs/PLAN-performance.md Phase 2). Either form exposes .transcribe,
+    so the collection/streaming units are runner-agnostic.
+    """
+    if settings.batch_size > 0:
+        from faster_whisper import BatchedInferencePipeline
+
+        return BatchedInferencePipeline(model=wm)
+    return wm
+
+
+def _transcribe_collect(runner: Any, path: str, kwargs: dict) -> tuple:
     """Blocking unit: transcribe + aggregate segments/text (worker thread)."""
-    segments, info = wm.transcribe(path, **kwargs)
+    segments, info = runner.transcribe(path, **kwargs)
     segment_list = [_segment_dict(seg) for seg in segments]
     full_text = "".join(seg["text"] for seg in segment_list).strip()
     return segment_list, info, full_text
@@ -757,10 +777,10 @@ def _transcribe_collect(wm: Any, path: str, kwargs: dict) -> tuple:
 # real client before promising strict parity.
 
 
-def _stream_worker(wm: Any, path: str, kwargs: dict, q: "queue.SimpleQueue") -> None:
+def _stream_worker(runner: Any, path: str, kwargs: dict, q: "queue.SimpleQueue") -> None:
     """Producer: ('segment', dict) / ('done', (info, text)) / ('error', msg) / ('end', None)."""
     try:
-        segments, info = wm.transcribe(path, **kwargs)
+        segments, info = runner.transcribe(path, **kwargs)
         parts = []
         for seg in segments:
             d = _segment_dict(seg)
@@ -773,11 +793,11 @@ def _stream_worker(wm: Any, path: str, kwargs: dict, q: "queue.SimpleQueue") -> 
         q.put(("end", None))
 
 
-async def _sse_stream(wm: Any, path: str, kwargs: dict, task: str):
+async def _sse_stream(runner: Any, path: str, kwargs: dict, task: str):
     """SSE generator: per-segment deltas, then transcript.done + [DONE]."""
     q: "queue.SimpleQueue" = queue.SimpleQueue()
     loop = asyncio.get_running_loop()
-    fut = loop.run_in_executor(_inference_pool(), _stream_worker, wm, path, kwargs, q)
+    fut = loop.run_in_executor(_inference_pool(), _stream_worker, runner, path, kwargs, q)
     try:
         while True:
             kind, payload = await run_in_threadpool(q.get)
@@ -859,6 +879,7 @@ async def health():
         "best_of": settings.best_of,
         "temperature_schedule": settings.temperature_schedule or None,
         "cpu_threads": settings.cpu_threads,
+        "batch_size": settings.batch_size,
     }
 
 
@@ -910,23 +931,25 @@ async def transcribe_audio(
         #    prompt kwarg `initial_prompt` (OpenAI calls it `prompt`).
         resolved_language = await _offload(_resolve_language, wm, tmp_path, language)
         resolved_prompt = prompt or settings.initial_prompt
+        runner = _build_runner(wm)
         kwargs = _build_kwargs(
             language=resolved_language,
             prompt=resolved_prompt,
             temperature=temperature if temperature is not None else 0.0,
+            batched=settings.batch_size > 0,
         )
 
         # 4. Optional OpenAI-style streaming (SSE); otherwise run inference
         #    off the event loop with the configured abandon-timeout.
         if stream:
             return StreamingResponse(
-                _sse_stream(wm, tmp_path, kwargs, task="transcribe"),
+                _sse_stream(runner, tmp_path, kwargs, task="transcribe"),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache"},
             )
 
         segment_list, info, full_text = await _maybe_timeout(
-            _offload(_transcribe_collect, wm, tmp_path, kwargs),
+            _offload(_transcribe_collect, runner, tmp_path, kwargs),
             settings.request_timeout_s,
         )
 
@@ -994,22 +1017,24 @@ async def translate_audio(
         # (OpenAI's translations endpoint always translates *to* English).
         resolved_language = await _offload(_resolve_language, wm, tmp_path, None)
         resolved_prompt = prompt or settings.initial_prompt
+        runner = _build_runner(wm)
         kwargs = _build_kwargs(
             language=resolved_language,
             prompt=resolved_prompt,
             temperature=temperature if temperature is not None else 0.0,
             task="translate",
+            batched=settings.batch_size > 0,
         )
 
         if stream:
             return StreamingResponse(
-                _sse_stream(wm, tmp_path, kwargs, task="translate"),
+                _sse_stream(runner, tmp_path, kwargs, task="translate"),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache"},
             )
 
         segment_list, info, full_text = await _maybe_timeout(
-            _offload(_transcribe_collect, wm, tmp_path, kwargs),
+            _offload(_transcribe_collect, runner, tmp_path, kwargs),
             settings.request_timeout_s,
         )
 

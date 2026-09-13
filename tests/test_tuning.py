@@ -164,3 +164,79 @@ def test_route_forwards_beam_and_schedule_to_model():
     assert kw["beam_size"] == 2
     assert kw["best_of"] == 2
     assert kw["temperature"] == [0.0, 0.2, 0.4]
+
+
+# -- Phase 2 (PLAN-performance.md) — opt-in BatchedInferencePipeline --------
+
+
+class _FakeBP:
+    """Delegating fake for faster_whisper.BatchedInferencePipeline."""
+
+    def __init__(self, model):
+        self.model = model
+
+    def transcribe(self, path, **kwargs):
+        return self.model.transcribe(path, **kwargs)
+
+
+def test_build_runner_returns_model_when_batch_zero(monkeypatch):
+    monkeypatch.setattr(app_module, "settings", Settings(batch_size=0))
+    model = FakeModel()
+    assert app_module._build_runner(model) is model
+
+
+def test_build_runner_wraps_when_batch_set(monkeypatch):
+    monkeypatch.setattr(app_module, "settings", Settings(batch_size=4))
+    monkeypatch.setattr("faster_whisper.BatchedInferencePipeline", _FakeBP)
+    model = FakeModel()
+    wrapped = app_module._build_runner(model)
+    assert isinstance(wrapped, _FakeBP)
+    assert wrapped.model is model
+
+
+def test_build_kwargs_batched_adds_batch_size(monkeypatch):
+    monkeypatch.setattr(app_module, "settings", Settings(batch_size=4))
+    kw = _build_kwargs(language=None, prompt=None, temperature=0.0, batched=True)
+    assert kw["batch_size"] == 4
+    kw_off = _build_kwargs(language=None, prompt=None, temperature=0.0, batched=False)
+    assert "batch_size" not in kw_off
+
+
+def test_route_uses_batched_runner(monkeypatch):
+    monkeypatch.setattr(app_module, "settings", Settings(batch_size=4))
+    monkeypatch.setattr("faster_whisper.BatchedInferencePipeline", _FakeBP)
+    model = FakeModel()
+    with _client(Settings(batch_size=4), model) as (client, _):
+        resp = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("a.wav", _make_wav(), "audio/wav")},
+            data={"model": "whisper-1"},
+        )
+        assert resp.status_code == 200
+        resp.json()
+    kw = model.transcribe_kwargs[-1]
+    assert kw["batch_size"] == 4
+
+
+def test_translate_route_uses_batched_runner(monkeypatch):
+    monkeypatch.setattr(app_module, "settings", Settings(batch_size=4))
+    monkeypatch.setattr("faster_whisper.BatchedInferencePipeline", _FakeBP)
+    model = FakeModel()
+    with _client(Settings(batch_size=4), model) as (client, _):
+        resp = client.post(
+            "/v1/audio/translations",
+            files={"file": ("a.wav", _make_wav(), "audio/wav")},
+            data={"model": "whisper-1"},
+        )
+        assert resp.status_code == 200
+        resp.json()
+    kw = model.transcribe_kwargs[-1]
+    assert kw["batch_size"] == 4
+    assert kw["task"] == "translate"
+
+
+def test_health_reports_batch_size():
+    with _client(Settings(batch_size=4), FakeModel()) as (client, _):
+        assert client.get("/health").json()["batch_size"] == 4
+    with _client(Settings(), FakeModel()) as (client, _):
+        assert client.get("/health").json()["batch_size"] == 0

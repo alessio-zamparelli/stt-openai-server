@@ -55,6 +55,8 @@ services:
       # - WHISPER_TEMPERATURES=0,0.2,0.4
       # CT2 intra-op threads; rule of thumb: cores / WHISPER_MAX_CONCURRENT.
       # - WHISPER_CPU_THREADS=2
+      # Batch whisper's ~30 s windows (opt-in; batched ignores condition_on_previous_text).
+      # - WHISPER_BATCH_SIZE=4
     volumes:
       # Persistent model weights across restarts (HF_HOME=/data/hf).
       - whisper-data:/data
