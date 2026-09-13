@@ -169,11 +169,11 @@ print(result.text)
 | `WHISPER_MAX_UPLOAD_MB` | `100` | Reject uploads whose byte size exceeds this (`413`, mid-stream; `0` = unlimited). Streams to disk in 1 MB chunks so RAM stays flat |
 | `WHISPER_MAX_AUDIO_SECONDS` | `3600` | Reject audio longer than this in container duration — OpenAI-style `400` *before* the model runs (`0` = off). Whisper processes audio in fixed ~30 s windows, so very long inputs cost multiples of the per-window floor |
 | `WHISPER_REQUEST_TIMEOUT_S` | `300` | Abandon-the-call timeout → `504` if inference exceeds it (`0` = off). CT2 can't be preempted, so the orphan drains in the bounded pool |
-| `WHISPER_BEAM_SIZE` | `5` | Beam width. Accuracy-first default; `2` ≈ 2× faster on multi-window clips but parity is run-dependent (see [Latency tuning](#latency-tuning)) |
-| `WHISPER_BEST_OF` | `5` | Candidates sampled when `temperature > 0`. Pair with `WHISPER_BEAM_SIZE` for latency tuning |
-| `WHISPER_TEMPERATURES` | *(fw default)* | Comma-separated fallback schedule, e.g. `0,0.2,0.4`. Trims whisper's default `[0…1.0]` ramp (a hidden multiplier) and overrides the per-request `temperature` scalar when set. Bad values fall back to the default schedule (no 500) |
-| `WHISPER_CPU_THREADS` | *(fw default)* | CT2 intra-op threads. `0` = faster-whisper default. Rule of thumb: `cores / WHISPER_MAX_CONCURRENT` — don't oversubscribe |
-| `WHISPER_BATCH_SIZE` | `0` | `>0` batches whisper's ~30 s windows with `BatchedInferencePipeline` (~3–4× on multi-window audio). Opt-in: batched mode ignores `condition_on_previous_text`, so casing/segmentation can drift. Best used together with beam/temperature tuning |
+| `WHISPER_BEAM_SIZE` | `5` | Beam width. Accuracy-first default; `2` ≈ 2× faster on multi-window clips but parity is run-dependent (see [Latency tuning](#latency-tuning) and [Accuracy impact](#accuracy-impact-per-knob)) |
+| `WHISPER_BEST_OF` | `5` | Candidate sampling when `temperature > 0` — inert at the server default `temperature=0` (beam search uses `WHISPER_BEAM_SIZE`). Pair with `WHISPER_BEAM_SIZE` for latency tuning |
+| `WHISPER_TEMPERATURES` | *(fw default)* | Comma-separated fallback schedule, e.g. `0,0.2,0.4`. Trims whisper's default `[0…1.0]` ramp (a hidden multiplier) and overrides the per-request `temperature` scalar when set. Does not change `temperature=0` output; the `>0` fallback passes sample an *unseeded* RNG, so borderline clips can flake run-to-run. Bad values fall back to the default schedule (no 500) |
+| `WHISPER_CPU_THREADS` | *(fw default)* | CT2 intra-op threads. `0` = faster-whisper default. Rule of thumb: `cores / WHISPER_MAX_CONCURRENT` — don't oversubscribe. **Accuracy-neutral (measured**: threads 1/2/4 produce byte-identical transcripts |
+| `WHISPER_BATCH_SIZE` | `0` | `>0` batches whisper's ~30 s windows with `BatchedInferencePipeline` (~3–4× on multi-window audio). Opt-in: batched mode ignores `condition_on_previous_text`, so casing/segmentation can drift (no *measured* accuracy regression on the reference corpus — see [Accuracy impact](#accuracy-impact-per-knob)). Best used together with beam/temperature tuning |
 | `WHISPER_VAD` | `false` | Pre-filter silence with Silero-VAD before transcription. Helps sparse / quiet audio; on all-speech clips it is a *net cost* (adds a full VAD pass). |
 | `WHISPER_HF_OFFLINE` | `false` | Load the model with `local_files_only=True` — never touch the Hugging Face hub (no revalidation round-trips). Fails fast if weights aren't already in `HF_HOME` |
 | `HF_HOME` | `/data/hf` (container) | Where model weights are downloaded/cached |
@@ -204,6 +204,41 @@ degraded to `per il tuo aiuto` on one utterance — so the server ships `beam=5/
 by default and these knobs are **opt-in** for latency-sensitive workloads. Treat the
 numbers as *ratios*, not absolutes: machine variance is large, re-measure on your own
 hardware.
+
+### Accuracy impact per knob
+
+Measured on the same reference corpus as the latency table (jfk + 9 short
+Italian TTS clips, `base`/int8, CPU, `lang=it`). Each row isolates **one** knob
+on the `beam=5/best=5` defaults. Whisper is deterministic at `temperature=0`;
+the only stochasticity is the `>0` fallback sampling (see
+`WHISPER_TEMPERATURES`).
+
+| Config (one knob vs default) | jfk | short phrases | sub-second words | Verdict |
+| --- | --- | --- | --- | --- |
+| default `beam=5/best=5` | 1/1 exact | 2/5 exact | 0/4 | baseline |
+| `beam=2` + `best_of=2` | 1/1 | **1/5** | 0/4 | **worse**: `come stai` → "o messa'i"; one word became a hallucination loop |
+| + `WHISPER_TEMPERATURES=0,0.2,0.4` | 1/1 | 2/5¹ | 0/4 | ≈ neutral: identical at `temp=0`; fallback flaked on one borderline clip (1/5 passes) |
+| `WHISPER_CPU_THREADS=2` | 1/1 | 2/5 | 0/4 | **identity**: transcripts byte-identical to default |
+| `WHISPER_CPU_THREADS=4` | 1/1 | 2/5 | 0/4 | **identity**: transcripts byte-identical to default |
+| `WHISPER_BATCH_SIZE=4` | 1/1 | 2/5 | 0/4 | no regression — one word clip even improved ("no" → "non so") |
+
+¹ `come stai` sits at the fallback threshold: 5 of 6 passes returned the correct
+`come stai.`, one flaked to `domenstai`. Longer clips are unaffected.
+
+📌 **What this means**
+
+- **`cpu_threads` is accuracy-neutral** — threads 1/2/4 produced *identical*
+  transcripts. It is pure parallelization; tune it for latency/throughput only.
+- **`beam=2` is measurably worse on short phrases** (one phrase dropped here,
+  matching the run-dependent parity caveat above). Keep `beam=5` for quality.
+- **A trimmed temperature schedule neither helps nor hurts the deterministic
+  path**; its only risk is the stochastic `>0` fallback on borderline clips.
+- **Batcher mode showed no accuracy regression** on this corpus; the structural
+  `condition_on_previous_text=False` caveat (casing/segmentation drift) still
+  applies — it just cost nothing on these 10 clips.
+- **Sub-second isolated words score 0/4 in *every* config** — the short-clip
+  failure mode (empties / repetition loops / one-word debris) is a model/corpus
+  floor, not a knob regression. `WHISPER_LANGUAGE` pinning is the mitigation.
 
 ### 🧪 Reproduce the measured baseline
 

@@ -129,10 +129,12 @@ new `max_concurrent` instead of inheriting a stale snapshot.
   `WHISPER_BEAM_SIZE` / `WHISPER_BEST_OF`), plumbed through `_build_kwargs`.
 - Default stays 5 (accuracy-first). The README gets a "latency tuning" table
   recommending `2/2` for TTS-pipeline-style short clips.
-- Accuracy gate before touching the default: spot-check jfk + the existing
-  Italian TTS clips at `beam=2` vs `beam=5` — exact-match/diff, plus no
-  repetition loops (the known short-clip failure mode). Flip the default only
-  if parity holds; otherwise ship the knob + docs.
+- Accuracy gate **before** touching the default (measured later, 10-clip
+  corpus: jfk + 9 Italian TTS clips): `beam=2` dropped `come stai` →
+  "o messa'i" and turned one isolated word into a hallucination loop
+  (1/5 phrases exact vs 2/5 at `beam=5`; jfk unaffected 1/1). Parity is
+  run-dependent and measurably worse on short phrases → default stays
+  `beam=5`; the knob ships opt-in + the README accuracy table.
 
 ### B. `WHISPER_TEMPERATURES` (trimmed fallback schedule)
 
@@ -141,6 +143,10 @@ new `max_concurrent` instead of inheriting a stale snapshot.
   accepts. Plumb via `_build_kwargs`.
 - Rationale (measured): fewer fallback passes = less hidden latency, and the
   trimmed schedule *fixed* a capitalization regression seen at plain `beam=2`.
+- Measured stability (same corpus): identical to default at `temperature=0`;
+  the `>0` fallback passes sample an *unseeded* RNG, so a borderline 2-word
+  clip flaked once in 5 passes (`come stai` → `domenstai`). No gain, no
+  regression in the deterministic path.
 - Risk: fewer retries on genuinely garbled audio → slightly worse worst-case.
   Documented as a latency/robustness tradeoff knob, default unchanged.
 
@@ -150,6 +156,9 @@ new `max_concurrent` instead of inheriting a stale snapshot.
   default (≈4 here). Guidance in README: `cpu_threads ≈ cores /
   WHISPER_MAX_CONCURRENT` keeps N concurrent transcriptions out of the
   oversubscription regime.
+- **Accuracy-neutral (measured)**: threads 2 and 4 produced *byte-identical*
+  transcripts to the default on the reference corpus — it is pure
+  parallelization; tune it for latency/throughput only.
 - Note the interplay with `WHISPER_MAX_CONCURRENT=2` (shipped): 2 × 4 threads
   on a 4-core box already oversubscribes; set one or the other, not both high.
 
@@ -174,6 +183,10 @@ new `max_concurrent` instead of inheriting a stale snapshot.
   does not use `condition_on_previous_text`; expect minor casing/segmentation
   differences vs sequential mode (seen in the probe). Keep it opt-in for
   batch/long-audio workloads where 4× wall-time matters more than case.
+- **Measured accuracy impact (10-clip corpus)**: no regression vs sequential
+  (2/5 phrases exact both; jfk 1/1 both); one isolated word even improved
+  ("" → "non so"). The `condition_on_previous_text=False` caveat is
+  structural but cost nothing on these clips. README accuracy table records it.
 - Reset-per-request: constructing `BatchedInferencePipeline` per request is
   cheap (wraps the model); cache one per store alongside `wm` if profiling
   shows otherwise.
