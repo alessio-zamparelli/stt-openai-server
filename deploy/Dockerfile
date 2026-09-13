@@ -2,14 +2,15 @@
 #
 # whisper-api — OpenAI-compatible Whisper server (CPU-only).
 #
-# Built with uv following the official integration guide:
+# Built with uv, following the reference pattern in
+# pocket-tts-openai-server/deploy/Dockerfile and the official uv Docker guide:
 #   https://docs.astral.sh/uv/guides/integration/docker/
 #
-# Builder stage uses the official uv base image (pinned to the exact uv
-# version that generated uv.lock, plus the matching Python).
-# Runtime stage uses plain python:3.14-slim — uv is not needed at runtime,
-# so we ship only the pre-built .venv. Both stages are bookworm so the
-# venv's python symlinks resolve identically.
+# The builder runs on python:3.14-slim (system Python 3.14) and copies the uv
+# binary from ghcr.io/astral-sh/uv:0.12.13 — pinned to the exact uv version that
+# generated uv.lock. Using the system interpreter with UV_PYTHON_DOWNLOADS=0
+# keeps the venv's Python path identical across both stages (the same image
+# name, python:3.14-slim, in builder and runtime) so copying .venv over is safe.
 #
 # Guide patterns applied: bind-mounted manifest files (no lockfile layer),
 # UV_COMPILE_BYTECODE, cache mounts, --no-editable, .venv via .dockerignore.
@@ -26,8 +27,12 @@
 ###############################################################################
 # Stage 1 — builder: resolve locked dependencies into a venv
 ###############################################################################
-FROM ghcr.io/astral-sh/uv:0.12.13-python3.14-bookworm-slim AS builder
+FROM python:3.14-slim AS builder
 
+# Pin uv to the exact version used to (re)generate uv.lock.
+COPY --from=ghcr.io/astral-sh/uv:0.12.13 /uv /uvx /bin/
+
+# Use the system Python already present in the slim image (3.14).
 ENV UV_PYTHON_DOWNLOADS=0 \
     UV_LINK_MODE=copy \
     UV_COMPILE_BYTECODE=1
@@ -45,11 +50,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 ###############################################################################
 # Stage 2 — runtime: minimal, non-root, persistent /data volume
 ###############################################################################
-FROM python:3.14-slim-bookworm AS runtime
+FROM python:3.14-slim AS runtime
 
-# OpenMP runtime needed by CTranslate2 for CPU multithreading.
+# OpenMP runtime needed by CTranslate2 for CPU multithreading, plus CA
+# certificates for downloading model weights from the Hugging Face Hub.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libgomp1 \
+    && apt-get install -y --no-install-recommends libgomp1 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # Reuse the system Python across stages; put the app venv on PATH.
