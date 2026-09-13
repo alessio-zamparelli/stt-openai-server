@@ -18,7 +18,7 @@
 | 3 | `await file.read()` buffers whole upload in RAM before disk write → ~2× peak RAM for large files | both routes (`content = await file.read()`) | Medium | **P0** |
 | 4 | Temp file always suffixed `.wav` regardless of real container | both routes (`suffix=".wav"`) | Low (PyAV sniffs; downstream tools may trust suffix) | P0 (cheap) |
 | 5 | No inference timeout → pathological file hangs a worker indefinitely | none | Medium | P1 |
-| 6 | No `stream=true` SSE for transcriptions (OpenAI compatibility gap) | none | Low ("may not matter") | P2 |
+| 6 | No `stream=true` SSE for transcriptions (OpenAI compatibility gap) | both routes (`stream=true`) | Low ("may not matter") | **P2 ✓ shipped** — SSE deltas + `[DONE]`; see Phase 3 |
 
 ## Measured evidence (this machine)
 
@@ -139,18 +139,20 @@ def _safe_suffix(filename: str | None) -> str:
 
 ---
 
-## Phase 3 (P2, optional) — streaming response
+## Phase 3 (P2) — streaming response — ✅ SHIPPED
 
-OpenAI supports `stream=true` on transcriptions (SSE deltas). faster-whisper
-yields segments lazily, so the data source is already a stream. MVP scope:
+`stream=true` is implemented (per-segment SSE deltas + `transcript.done` +
+`[DONE]`), built on the lazy segments faster-whisper already yields:
 
 - `stream=true` + `response_format=json|verbose_json` only (OpenAI streams
-  structured JSON, not text/srt/vtt).
-- Incremental segment iteration → per-segment SSE events, then a final JSON
-  frame — replaces today's `list(segments)` assembly on this path.
-- **Explicitly deferred**: "may not matter for most users"; not worth the
-  OpenAI-spec risk until P0/P1 are shipped and there is a real client to test
-  against.
+  structured JSON, not text/srt/vtt). `_stream_worker` (pool thread) pushes
+  each segment as it decodes; `_sse_stream` forwards it to the SSE response.
+- Serialized on the shared model via `_inference_lock` — same single-decode
+  guarantee as the non-stream path.
+- e2e: `test_streaming_emits_deltas_and_done` (test_robustness) plus SSE
+  progressiveness asserted throughout the e2e suite.
+- **Caveat**: wire-format *parity* with a genuine OpenAI client is best-effort
+  — no external SSE consumer has run against it yet.
 
 ---
 
@@ -169,12 +171,17 @@ table + troubleshooting, `docker-compose.yml` commented knobs, and the suites
 
 ## Risks / open questions
 
-- **Concurrent `transcribe()` on one `WhisperModel`** — not yet verified safe
-  upstream; Phase-1 step A resolves it (fallback: serialize inference under a
-  lock, which still fixes `/health`).
+- **Concurrent `transcribe()` on one `WhisperModel`** — **resolved** with the
+  Phase-1 fallback: a module-level serialize lock (`_inference_lock`) wraps
+  `transcribe()` **and** the lazy segment iteration in both
+  `_transcribe_collect` and `_stream_worker`, so concurrent requests queue on
+  the shared model instead of racing it. `WHISPER_MAX_CONCURRENT` now bounds
+  the *queue*, not parallel decodes; `/health` never touches the lock. Guarded
+  by 2 unit tests (`test_inference_serialized_across_concurrent_collects`,
+  `test_stream_worker_serialized_across_concurrent_calls`).
 - **Timed-out orphan threads** briefly hold a model + worker slot; bounded by
   `WHISPER_MAX_CONCURRENT`; acceptable backstop semantics (documented).
 - **413 (bytes) vs 400 (duration)** deliberately split; note the divergence from
   OpenAI (which 400s too-long audio) in the README.
-- `stream=true` needs a real SSE-consuming client for spec verification before
-  it can be called compatible.
+- `stream=true` is shipped but still lacks a genuine external SSE client for
+  spec verification — parity stays best-effort until one has consumed it.

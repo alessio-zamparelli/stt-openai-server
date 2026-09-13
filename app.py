@@ -549,6 +549,12 @@ def _safe_suffix(filename: Optional[str]) -> str:
 
 _inference_executor: Optional[futures.ThreadPoolExecutor] = None
 _inference_pool_lock = threading.Lock()
+# Serializer for the single shared model. faster-whisper's WhisperModel is NOT
+# safe for concurrent transcribe() on one instance, and the decode is lazy (it
+# runs on segment iteration), so the lock wraps BOTH the call and the full
+# iteration. Concurrent requests (bounded upstream by WHISPER_MAX_CONCURRENT)
+# queue here instead of racing the model — docs/PLAN-robustness-concurrency.md.
+_inference_lock = threading.Lock()
 
 
 def _build_inference_pool_locked() -> None:
@@ -810,9 +816,14 @@ def _build_runner(wm: Any) -> Any:
 
 
 def _transcribe_collect(runner: Any, path: str, kwargs: dict) -> tuple:
-    """Blocking unit: transcribe + aggregate segments/text (worker thread)."""
-    segments, info = runner.transcribe(path, **kwargs)
-    segment_list = [_segment_dict(seg) for seg in segments]
+    """Blocking unit: transcribe + aggregate segments/text (worker thread).
+
+    Serialized on the shared model — ``runner.transcribe`` is lazy, so the
+    lock covers the segment iteration too (that is where the decode runs).
+    """
+    with _inference_lock:
+        segments, info = runner.transcribe(path, **kwargs)
+        segment_list = [_segment_dict(seg) for seg in segments]
     full_text = "".join(seg["text"] for seg in segment_list).strip()
     return segment_list, info, full_text
 
@@ -826,14 +837,18 @@ def _transcribe_collect(runner: Any, path: str, kwargs: dict) -> tuple:
 
 
 def _stream_worker(runner: Any, path: str, kwargs: dict, q: "queue.SimpleQueue") -> None:
-    """Producer: ('segment', dict) / ('done', (info, text)) / ('error', msg) / ('end', None)."""
+    """Producer: ('segment', dict) / ('done', (info, text)) / ('error', msg) / ('end', None).
+
+    Serialized like ``_transcribe_collect`` (shared model, lazy decode).
+    """
     try:
-        segments, info = runner.transcribe(path, **kwargs)
-        parts = []
-        for seg in segments:
-            d = _segment_dict(seg)
-            parts.append(d["text"])
-            q.put(("segment", d))
+        with _inference_lock:
+            segments, info = runner.transcribe(path, **kwargs)
+            parts = []
+            for seg in segments:
+                d = _segment_dict(seg)
+                parts.append(d["text"])
+                q.put(("segment", d))
         q.put(("done", (info, "".join(parts).strip())))
     except Exception as e:  # surfaced to the client as an SSE error event
         q.put(("error", repr(e)))

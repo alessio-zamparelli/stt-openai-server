@@ -153,16 +153,19 @@ new `max_concurrent` instead of inheriting a stale snapshot.
 ### C. `WHISPER_CPU_THREADS` (right-size the pool)
 
 - `WhisperModel(..., cpu_threads=N)`; knob default `0` = faster-whisper's own
-  default (≈4 here). Guidance in README: `cpu_threads ≈ cores /
-  WHISPER_MAX_CONCURRENT` keeps N concurrent transcriptions out of the
-  oversubscription regime.
+  default (≈4 here). Since inference is serialized on the one shared model
+  (robustness plan), a single decode is the only consumer — README now guides
+  `cpu_threads ≈ cores` (below it is safe; oversubscription only occurs if a
+  single decode exceeds physical cores).
 - **Accuracy-neutral (measured)**: threads 2 and 4 produced *byte-identical*
-  transcripts to the default on the reference corpus — it is pure
-  parallelization; tune it for latency/throughput only. Measured caveat: on
-  short-clip bursts (accuracy corpus, 10 tiny clips) it *added* ~8% wall time
-  — intra-op threading pays off on long single clips, not many tiny ones.
-- Note the interplay with `WHISPER_MAX_CONCURRENT=2` (shipped): 2 × 4 threads
-  on a 4-core box already oversubscribes; set one or the other, not both high.
+  transcripts to the default on the reference corpus — it is purely intra-op
+  parallelisation within one decode; tune it for latency/throughput only.
+  Measured caveat: on short-clip bursts (accuracy corpus, 10 tiny clips) it
+  *added* ~8% wall time — intra-op threading pays off on long single clips,
+  not many tiny ones.
+- Interplay with `WHISPER_MAX_CONCURRENT` is now *serialized*: only one decode
+  runs at a time, so `MAX_CONCURRENT` bounds the **queue**, not overlapping
+  decodes. `cpu_threads × cores` no longer compounds across workers.
 
 ### Phase-1 tests
 
@@ -317,3 +320,4 @@ knobs, and both suites. Phases stay individually green and ship separately.
 - **Phase 1** ✅ — `WHISPER_BEAM_SIZE`/`WHISPER_BEST_OF`/`WHISPER_TEMPERATURES`/`WHISPER_CPU_THREADS` env knobs + `_parse_temperatures` + `_build_kwargs`/loader forwarding + `/health` reporting; 14 unit + 4 e2e tests. **Accuracy gate: FAIL to flip** — jfk + Italian TTS clips showed beam2 parity is *run-dependent* (jfk/buongiorno/stazione passed, `grazie mille per il tuo aiuto` degraded to `per il tuo aiuto` on one utterance; one run also drifted on ciao + stazione). Defaults stay `beam=5/best=5`; knobs are opt-in. README latency-tuning table + env rows, compose knob comments.
 - **Phase 2** ✅ — `WHISPER_BATCH_SIZE` (0 = sequential; >0 wraps the model in `BatchedInferencePipeline`). Correctness + SSE progressiveness asserted always; the `< 0.75×` wall-time gate is **opt-in** (`PERF_WALLTIME=1`) because shared-host noise reversed one-shot ratios (observed 0.56×–1.44×); with the gate active on a quiet host it measured 0.33×.
 - **Phase 3** ✅ — `WHISPER_VAD` (`vad_filter=True`), `WHISPER_HF_OFFLINE` (`local_files_only=True`), per-stage rolling p50/p95 (`upload/duration/language/inference/total`, 200-sample window) at `/health.latency_ms` (13 unit tests in `tests/test_timings.py` + 2 e2e offline); README ops runbook (one resident model per host — the 3–4 s contention floor is an ops problem) + **3H** env-preset table ↔ compose preset blocks with drift-guard `tests/test_plan_docs.py` (app.py ⇄ README config ⇄ preset table ⇄ compose are bidirectionally consistent).
+- **Docs follow-ups** ✅ `5990ab5` `a79dc90` — measured per-knob **accuracy** gate on the reference corpus (README “Accuracy impact per knob” + same-corpus best-of-2 timings): `cpu_threads` accuracy-neutral (byte-identical transcripts at 1/2/4), `beam=2` measurably *worse* on short phrases (`come stai` → “o messa'i”; keeps `beam=5`), trimmed schedule ≈ neutral (unseeded `>0` fallback flakes 1/5 passes), `batch_size=4` no regression.

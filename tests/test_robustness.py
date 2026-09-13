@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import io
 import math
+import queue
 import threading
+import time
 import wave
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -398,3 +400,90 @@ def test_lifespan_inits_and_resets_pool():
         assert app_module._inference_executor is not None
         assert app_module._inference_executor._max_workers == 2
     assert app_module._inference_executor is None  # shutdown resets
+
+
+# --------------------------------------------------------------------------
+# Serialize-lock on the single shared model (concurrent transcribe() race)
+# --------------------------------------------------------------------------
+
+class _SerializeProbe:
+    """Fake runner tracking peak concurrent inference calls, including the
+    lazy decode during segment iteration.
+
+    One enter/exit pair spans ``transcribe()`` AND the full iteration (the
+    exit fires in the generator's ``finally`` when it is exhausted). With the
+    serialize lock held across call + iteration two threads never overlap →
+    ``max_active`` stays 1; a lock covering only the call (or none) would hit
+    2 here because the 50 ms sleep forces the decode windows to intersect.
+    """
+
+    def __init__(self) -> None:
+        self._active = 0
+        self.max_active = 0
+        self._mu = threading.Lock()
+
+    def _enter(self) -> None:
+        with self._mu:
+            self._active += 1
+            self.max_active = max(self.max_active, self._active)
+
+    def _exit(self) -> None:
+        with self._mu:
+            self._active -= 1
+
+    def transcribe(self, audio, **kwargs):
+        self._enter()
+
+        def gen():
+            try:
+                time.sleep(0.05)  # overlap window if the lock is missing
+                yield _seg(0, "ok")
+            finally:
+                self._exit()  # call ends when the lazy decode is exhausted
+
+        return gen(), Info("en")
+
+
+def _run_concurrent(fn):
+    """Run ``fn()`` in two threads released simultaneously; join both."""
+    barrier = threading.Barrier(3)
+
+    def run():
+        barrier.wait()
+        fn()
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    for t in threads:
+        t.start()
+    barrier.wait()
+    for t in threads:
+        t.join()
+
+
+def test_inference_serialized_across_concurrent_collects():
+    """Two threads transcribing the shared model never overlap: the serialize
+    lock covers the lazy decode, so max_active stays at 1 (never interleaved)."""
+    probe = _SerializeProbe()
+    results: List[Any] = []
+    _run_concurrent(
+        lambda: results.append(
+            app_module._transcribe_collect(probe, "/tmp/probe.wav", {})
+        )
+    )
+    assert len(results) == 2
+    assert probe.max_active == 1  # no two callers overlapped at any point
+    assert all(len(r[0]) == 1 and r[0][0]["text"] == "ok" for r in results)
+
+
+def test_stream_worker_serialized_across_concurrent_calls():
+    """The SSE producer also holds the serialize lock: two concurrent
+    producers never overlap and both still emit done+end."""
+    probe = _SerializeProbe()
+    q: "queue.SimpleQueue" = queue.SimpleQueue()
+    _run_concurrent(lambda: app_module._stream_worker(probe, "/tmp/probe.wav", {}, q))
+    kinds = []
+    while not q.empty():
+        kinds.append(q.get())
+    assert probe.max_active == 1
+    assert kinds.count(("end", None)) == 2
+    assert sum(1 for k in kinds if k[0] == "done") == 2
