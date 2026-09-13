@@ -21,6 +21,12 @@ services:
       # - WHISPER_COMPUTE_TYPE=int8
       # Load the model on first request instead of at startup.
       # - WHISPER_LAZY_LOAD=false
+      # Idle model eviction (0 disables): drop the model from RAM after this
+      # many seconds without API requests; next request reloads it (~0.5s warm).
+      # Drop to a lower value (e.g. 60) if you prioritize RAM over wake cost.
+      # - WHISPER_IDLE_UNLOAD_S=300
+      # How often the watchdog checks the idle window (seconds).
+      # - WHISPER_IDLE_POLL_S=30
     volumes:
       # Persistent model weights across restarts (HF_HOME=/data/hf).
       - whisper-data:/data

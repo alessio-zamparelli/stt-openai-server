@@ -6,15 +6,21 @@ with defaults matching the OpenAI Whisper API, using the
 'base' model with INT8 quantization.
 """
 
+import ctypes
+import gc
+import logging
 import os
 import tempfile
+import threading
 import time
 from contextlib import asynccontextmanager
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional
 
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -30,6 +36,8 @@ class Settings(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8080
     lazy_load: bool = False
+    idle_unload_s: int = 300  # evict the model to free RAM after this much idle; 0 = off
+    idle_poll_s: int = 30  # watchdog cadence (only when idle_unload_s > 0)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -54,30 +62,19 @@ settings = Settings(
     host=os.getenv("WHISPER_HOST", "0.0.0.0"),
     port=_env_int("WHISPER_PORT", 8080),
     lazy_load=_env_bool("WHISPER_LAZY_LOAD", False),
+    idle_unload_s=_env_int("WHISPER_IDLE_UNLOAD_S", 300),
+    idle_poll_s=_env_int("WHISPER_IDLE_POLL_S", 30),
 )
 
 
 # ---------------------------------------------------------------------------
-# Global state
+# Global state: ModelStore (idle-eviction + lazy reload)
 # ---------------------------------------------------------------------------
-
-model = None  # type: Any
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global model
-    if not settings.lazy_load:
-        model = _load_model()
-        print(
-            f"[server] Loaded faster-whisper model "
-            f"'{settings.model_name}' on {settings.device} ({settings.compute_type})"
-        )
-    yield
-    # Cleanup
-    if model is not None:
-        del model
-        model = None
+# See docs/PLAN-idle-unload.md — port of pocket-tts-openai-server M5.5.
+# The store owns the faster-whisper model; after `idle_unload_s` without API
+# requests the watchdog drops it so RSS returns toward the process floor
+# (measured ~507 MB -> ~108 MB for `base`/int8), and the next request blocks
+# until it reloads (warm HF cache ~0.5 s).
 
 
 def _load_model():
@@ -90,11 +87,135 @@ def _load_model():
     )
 
 
-def _ensure_model():
-    global model
-    if model is None:
-        model = _load_model()
-    return model
+class ModelStore:
+    """Holder for the faster-whisper model with idle-eviction + lazy reload.
+
+    ``loader`` is injectable for tests (defaults to ``_load_model``); with
+    ``idle_unload_s == 0`` eviction is disabled entirely (fakes, tests that
+    need a resident model, or operators who want it always-hot).
+    """
+
+    def __init__(self, config: Settings, loader: Callable[[], Any] | None = None):
+        self._config = config
+        self._loader = loader if loader is not None else _load_model
+        self._model: Any = None
+        self._last_activity = time.monotonic()
+        self._lock = threading.Lock()  # serializes load + eviction
+        self.loaded = False
+        self.unloads = 0  # idle-eviction events (model dropped)
+        self.reloads = 0  # model rebuilds (initial load + post-eviction)
+
+    @property
+    def eviction_enabled(self) -> bool:
+        return self._config.idle_unload_s > 0
+
+    def touch(self) -> None:
+        """Record an API request — resets the idle window. NEVER called by
+        /health (continuous health probes would defeat eviction)."""
+        self._last_activity = time.monotonic()
+
+    def last_request_age(self) -> float:
+        return time.monotonic() - self._last_activity
+
+    def get(self) -> Any:
+        """Return the resident model, building it single-flight if absent/evicted.
+
+        Concurrent callers block on ``_lock`` and share the first rebuild (no
+        thundering herd). Callers must capture the returned model into a local
+        and use that reference for the whole request — a concurrent eviction
+        can then clear the store's pointer without tearing down the model the
+        request is using.
+        """
+        with self._lock:
+            if self._model is None:
+                self._model = self._loader()
+                self.loaded = True
+                self.reloads += 1
+                if self.reloads == 1:
+                    logger.info(
+                        "model loaded: '%s' on %s (%s)",
+                        self._config.model_name,
+                        self._config.device,
+                        self._config.compute_type,
+                    )
+                else:
+                    logger.info("model reloaded after eviction (loaded %d times)", self.reloads)
+            return self._model
+
+    def maybe_unload(self, now: float | None = None) -> bool:
+        """Evict the resident model if idle past ``idle_unload_s``.
+
+        Returns True if the model was dropped. Non-blocking on ``_lock`` so an
+        in-flight transcription is never evicted under it (watchdog retries
+        next tick). Best-effort returns freed heap to the OS via gc + trim.
+        """
+        if not self.eviction_enabled or self._model is None:
+            return False
+        if now is None:
+            now = time.monotonic()
+        if now - self._last_activity < self._config.idle_unload_s:
+            return False
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            # Re-check under the lock; a request may have landed since we looked.
+            if (
+                self._model is not None
+                and now - self._last_activity >= self._config.idle_unload_s
+            ):
+                self._model = None
+                self.loaded = False
+                self.unloads += 1
+                gc.collect()
+                try:
+                    ctypes.CDLL("libc.so.6").malloc_trim(0)
+                except Exception:  # pragma: no cover - non-glibc
+                    pass
+                logger.info(
+                    "idle %.0fs: evicted model to free RAM (unloads=%d)",
+                    self._config.idle_unload_s,
+                    self.unloads,
+                )
+                return True
+            return False
+        finally:
+            self._lock.release()
+
+
+store = ModelStore(settings)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if not settings.lazy_load:
+        store.get()  # eager pre-load at startup
+        print(
+            f"[server] faster-whisper model '{settings.model_name}' "
+            f"on {settings.device} ({settings.compute_type})"
+        )
+
+    # RAM-reclamation watchdog: evict the idle model (PLAN-idle-unload.md).
+    # Only spawned when eviction is enabled (idle_unload_s > 0). Health probes
+    # never call store.touch(), so they don't reset the idle window.
+    stop = threading.Event()
+    app.state._idle_stop = stop
+    if store.eviction_enabled:
+        threading.Thread(target=_idle_watchdog, args=(stop,), daemon=True).start()
+
+    try:
+        yield
+    finally:
+        stop.set()
+
+
+def _idle_watchdog(stop: threading.Event) -> None:
+    """Periodically evict the model after ``idle_unload_s`` without API requests."""
+    interval = min(settings.idle_poll_s, max(5, settings.idle_unload_s // 2))
+    while not stop.wait(interval):
+        try:
+            store.maybe_unload()
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("idle-unload watchdog failed")
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +422,19 @@ async def list_models():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": settings.model_name, "compute_type": settings.compute_type}
+    """Liveness + model/eviction visibility. `loaded` is False after an idle
+    eviction (the next request wakes the model). Health probes deliberately do
+    NOT touch the idle timer, so they never reset the eviction window."""
+    return {
+        "status": "ok",
+        "model": settings.model_name,
+        "compute_type": settings.compute_type,
+        "loaded": store.loaded,
+        "idle_unload_s": settings.idle_unload_s,
+        "last_request_age_s": round(store.last_request_age(), 1),
+        "unloads": store.unloads,
+        "reloads": store.reloads,
+    }
 
 
 @app.post("/v1/audio/transcriptions", response_model=TranscriptionResponse)
@@ -324,6 +457,11 @@ async def transcribe_audio(
     # Fail fast on unsupported formats, before touching the model (OpenAI: 400).
     fmt = _validate_response_format(response_format)
 
+    # Record real API demand (never /health), then capture the model into a
+    # local ref so a concurrent idle-eviction can't tear it down mid-request.
+    store.touch()
+    wm = store.get()
+
     # 1. Save uploaded file to a temp location
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
         content = await file.read()
@@ -331,8 +469,6 @@ async def transcribe_audio(
         tmp_path = tmp.name
 
     try:
-        wm = _ensure_model()
-
         # 2. Build transcription kwargs
         kwargs: dict = {
             "beam_size": 5,
@@ -408,14 +544,17 @@ async def translate_audio(
     """
     fmt = _validate_response_format(response_format)
 
+    # Record real API demand (never /health), then capture the model into a
+    # local ref so a concurrent idle-eviction can't tear it down mid-request.
+    store.touch()
+    wm = store.get()
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
         content = await file.read()
         tmp.write(content)
         tmp_path = tmp.name
 
     try:
-        wm = _ensure_model()
-
         kwargs: dict = {
             "beam_size": 5,
             "best_of": 5,

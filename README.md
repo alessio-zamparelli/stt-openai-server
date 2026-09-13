@@ -68,10 +68,16 @@ uv run python app.py
 
 ```bash
 curl http://localhost:8080/health
-# {"status":"ok","model":"base","compute_type":"int8"}
+# {"status":"ok","model":"base","compute_type":"int8",
+#  "loaded":true,"idle_unload_s":300,"last_request_age_s":0.0,
+#  "unloads":0,"reloads":1}
 
 curl http://localhost:8080/v1/models
 ```
+
+The `loaded`, `unloads`, `reloads` and `last_request_age_s` fields expose the
+[Idle memory](/docs/PLAN-idle-unload.md) lifecycle. Health probes deliberately do
+**not** reset the idle timer, so monitoring traffic never defeats eviction.
 
 ## 📡 API Usage
 
@@ -154,6 +160,8 @@ print(result.text)
 | `WHISPER_HOST` | `0.0.0.0` | Bind host |
 | `WHISPER_PORT` | `8080` | Bind port |
 | `WHISPER_LAZY_LOAD` | `false` | Defer model load until the first request |
+| `WHISPER_IDLE_UNLOAD_S` | `300` | Evict the model from RAM after this many seconds with no API requests (`0` disables; next request reloads it ~0.5s warm). See [Idle memory](/docs/PLAN-idle-unload.md) |
+| `WHISPER_IDLE_POLL_S` | `30` | How often the watchdog re-checks the idle window |
 | `HF_HOME` | `/data/hf` (container) | Where model weights are downloaded/cached |
 
 > 📌 The `model` field in requests is accepted for OpenAI compatibility but
