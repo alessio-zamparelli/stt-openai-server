@@ -213,22 +213,30 @@ on the `beam=5/best=5` defaults. Whisper is deterministic at `temperature=0`;
 the only stochasticity is the `>0` fallback sampling (see
 `WHISPER_TEMPERATURES`).
 
-| Config (one knob vs default) | jfk | short phrases | sub-second words | Verdict |
-| --- | --- | --- | --- | --- |
-| default `beam=5/best=5` | 1/1 exact | 2/5 exact | 0/4 | baseline |
-| `beam=2` + `best_of=2` | 1/1 | **1/5** | 0/4 | **worse**: `come stai` → "o messa'i"; one word became a hallucination loop |
-| + `WHISPER_TEMPERATURES=0,0.2,0.4` | 1/1 | 2/5¹ | 0/4 | ≈ neutral: identical at `temp=0`; fallback flaked on one borderline clip (1/5 passes) |
-| `WHISPER_CPU_THREADS=2` | 1/1 | 2/5 | 0/4 | **identity**: transcripts byte-identical to default |
-| `WHISPER_CPU_THREADS=4` | 1/1 | 2/5 | 0/4 | **identity**: transcripts byte-identical to default |
-| `WHISPER_BATCH_SIZE=4` | 1/1 | 2/5 | 0/4 | no regression — one word clip even improved ("no" → "non so") |
+| Config (one knob vs default) | jfk | short phrases | sub-sec words | corpus time² | Verdict |
+| --- | --- | --- | --- | --- | --- |
+| default `beam=5/best=5` | 1/1 exact | 2/5 exact | 0/4 | 10.5 s | baseline |
+| `beam=2` + `best_of=2` | 1/1 | **1/5** | 0/4 | 7.3 s (≈1.4×) | **worse**: `come stai` → "o messa'i"; one word became a hallucination loop |
+| + `WHISPER_TEMPERATURES=0,0.2,0.4` | 1/1 | 2/5¹ | 0/4 | 9.3 s (≈1.1×) | ≈ neutral: identical at `temp=0`; fallback flaked on one borderline clip (1/5 passes) |
+| `WHISPER_CPU_THREADS=2` | 1/1 | 2/5 | 0/4 | 11.3 s | **identity**: transcripts byte-identical to default — *no* latency win on tiny-clip bursts |
+| `WHISPER_CPU_THREADS=4` | 1/1 | 2/5 | 0/4 | 11.3 s | **identity**: transcripts byte-identical to default — *no* latency win on tiny-clip bursts |
+| `WHISPER_BATCH_SIZE=4` | 1/1 | 2/5 | 0/4 | 7.8 s (≈1.3×) | no regression — one word clip even improved ("no" → "non so") |
 
 ¹ `come stai` sits at the fallback threshold: 5 of 6 passes returned the correct
 `come stai.`, one flaked to `domenstai`. Longer clips are unaffected.
 
+² Wall time to transcribe the whole accuracy corpus (10 clips ≈ 11 s audio),
+best-of-2 min, same machine as the latency table, `base`/int8 CPU. Ratios, not
+absolutes — board-to-board variance is large. Note the threads row: intra-op
+threading *adds* overhead when the work is many tiny clips; its win shows on
+long single clips (see `WHISPER_CPU_THREADS`, 5.51 s @ 33 s above).
+
 📌 **What this means**
 
 - **`cpu_threads` is accuracy-neutral** — threads 1/2/4 produced *identical*
-  transcripts. It is pure parallelization; tune it for latency/throughput only.
+  transcripts. It is pure parallelization; tune it for latency/throughput
+  only. Caveat: on short-clip bursts it *adds* overhead (measured ≈ 8% on the
+  accuracy corpus) — its win is on long single clips.
 - **`beam=2` is measurably worse on short phrases** (one phrase dropped here,
   matching the run-dependent parity caveat above). Keep `beam=5` for quality.
 - **A trimmed temperature schedule neither helps nor hurts the deterministic

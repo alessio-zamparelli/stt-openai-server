@@ -158,7 +158,9 @@ new `max_concurrent` instead of inheriting a stale snapshot.
   oversubscription regime.
 - **Accuracy-neutral (measured)**: threads 2 and 4 produced *byte-identical*
   transcripts to the default on the reference corpus — it is pure
-  parallelization; tune it for latency/throughput only.
+  parallelization; tune it for latency/throughput only. Measured caveat: on
+  short-clip bursts (accuracy corpus, 10 tiny clips) it *added* ~8% wall time
+  — intra-op threading pays off on long single clips, not many tiny ones.
 - Note the interplay with `WHISPER_MAX_CONCURRENT=2` (shipped): 2 × 4 threads
   on a 4-core box already oversubscribes; set one or the other, not both high.
 
