@@ -1,0 +1,7 @@
+{
+  "venvPath": "/workspace",
+  "venv": ".venv",
+  "pythonPath": "/workspace/.venv/bin/python",
+  "extraPaths": ["/workspace/.venv/lib/python3.14/site-packages"],
+  "typeCheckingMode": "basic"
+}

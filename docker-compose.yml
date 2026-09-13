@@ -1,0 +1,36 @@
+# Local development / self-host convenience wrapper around deploy/Dockerfile.
+# Not needed for GitHub Actions (GHCR publishes from the workflow directly).
+# Usage: docker compose up -d --build   (then POST to http://localhost:8080)
+name: whisper-api
+
+services:
+  whisper:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    image: whisper-api:local
+    ports:
+      - "8080:8080"
+    environment:
+      # Optional knobs (see README "Configuration (env vars)"). API key left unset.
+      - WHISPER_HOST=0.0.0.0
+      - WHISPER_PORT=8080
+      # Model size: tiny | base (default) | small | medium | large-v3
+      # - WHISPER_MODEL_NAME=base
+      # INT8 quantization: ~2x faster than fp32 on CPU, negligible quality loss.
+      # - WHISPER_COMPUTE_TYPE=int8
+      # Load the model on first request instead of at startup.
+      # - WHISPER_LAZY_LOAD=false
+    volumes:
+      # Persistent model weights across restarts (HF_HOME=/data/hf).
+      - whisper-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=4).read()"]
+      interval: 30s
+      timeout: 5s
+      start_period: 180s
+      retries: 3
+
+volumes:
+  whisper-data:
