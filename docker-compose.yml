@@ -36,6 +36,17 @@ services:
       # - WHISPER_LANGUAGES=it,en
       # Prompt applied whenever a request doesn't send one (conditions decode).
       # - WHISPER_INITIAL_PROMPT=The transcript is:
+      # Robustness / resource limits (see docs/PLAN-robustness-concurrency.md):
+      # Max simultaneously-running transcriptions (bounded threadpool; 0=unbounded).
+      # Offloads the event loop so /health stays responsive under load.
+      # - WHISPER_MAX_CONCURRENT=2
+      # Reject uploads larger than this in MB (413, streamed; 0=unlimited).
+      # - WHISPER_MAX_UPLOAD_MB=100
+      # Reject audio longer than this many seconds (400; 0=off). Whisper processes
+      # fixed ~30s windows, so long inputs cost multiples of the per-window floor.
+      # - WHISPER_MAX_AUDIO_SECONDS=3600
+      # Abandon-the-call timeout in seconds -> 504 (0=off).
+      # - WHISPER_REQUEST_TIMEOUT_S=300
     volumes:
       # Persistent model weights across restarts (HF_HOME=/data/hf).
       - whisper-data:/data

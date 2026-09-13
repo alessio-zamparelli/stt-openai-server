@@ -6,19 +6,25 @@ with defaults matching the OpenAI Whisper API, using the
 'base' model with INT8 quantization.
 """
 
+import asyncio
 import ctypes
 import gc
+import json
 import logging
 import os
+import queue
 import tempfile
 import threading
 import time
+from concurrent import futures
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, Callable, List, Optional
 
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +50,11 @@ class Settings(BaseModel):
     default_language: Optional[str] = None  # WHISPER_LANGUAGE
     allowed_languages: Optional[str] = None  # WHISPER_LANGUAGES  e.g. "it,en"
     initial_prompt: Optional[str] = None  # WHISPER_INITIAL_PROMPT
+    # Robustness / resource limits (docs/PLAN-robustness-concurrency.md).
+    max_concurrent: int = 2  # WHISPER_MAX_CONCURRENT (0 = unbounded threadpool)
+    max_upload_mb: int = 100  # WHISPER_MAX_UPLOAD_MB (0 = unlimited)
+    max_audio_seconds: int = 3600  # WHISPER_MAX_AUDIO_SECONDS (0 = off)
+    request_timeout_s: float = 300.0  # WHISPER_REQUEST_TIMEOUT_S (0 = off)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -61,6 +72,14 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    """Parse a float env var, falling back to the default on bad input."""
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 settings = Settings(
     model_name=os.getenv("WHISPER_MODEL_NAME", "base"),
     device=os.getenv("WHISPER_DEVICE", "cpu"),
@@ -73,6 +92,10 @@ settings = Settings(
     default_language=os.getenv("WHISPER_LANGUAGE") or None,
     allowed_languages=os.getenv("WHISPER_LANGUAGES") or None,
     initial_prompt=os.getenv("WHISPER_INITIAL_PROMPT") or None,
+    max_concurrent=_env_int("WHISPER_MAX_CONCURRENT", 2),
+    max_upload_mb=_env_int("WHISPER_MAX_UPLOAD_MB", 100),
+    max_audio_seconds=_env_int("WHISPER_MAX_AUDIO_SECONDS", 3600),
+    request_timeout_s=_env_float("WHISPER_REQUEST_TIMEOUT_S", 300.0),
 )
 
 
@@ -482,6 +505,248 @@ def _text_response(fmt: str, segment_list, full_text: str) -> PlainTextResponse:
 
 
 # ---------------------------------------------------------------------------
+# Robustness helpers (docs/PLAN-robustness-concurrency.md)
+# ---------------------------------------------------------------------------
+
+# Temp-file suffixes we pass through. PyAV probes the container from the bytes
+# (never trusts the extension); mapping real suffixes is hygiene for anything
+# downstream that does trust it.
+_ALLOWED_SUFFIXES = {
+    ".wav", ".mp3", ".flac", ".m4a", ".ogg", ".opus", ".aac", ".wma",
+    ".webm", ".mp4", ".avi", ".mov", ".mkv", ".amr", ".3gp", ".aiff",
+}
+
+
+def _safe_suffix(filename: Optional[str]) -> str:
+    """Sanitized, whitelisted extension for the temp copy of an upload."""
+    ext = (Path(filename or "").suffix or "").lower()
+    return ext if ext in _ALLOWED_SUFFIXES else ".bin"
+
+
+_inference_executor: Optional[futures.ThreadPoolExecutor] = None
+
+
+def _inference_pool() -> Optional[futures.ThreadPoolExecutor]:
+    """Bounded worker pool for inference (None -> anyio pool, unbounded)."""
+    global _inference_executor
+    if settings.max_concurrent > 0:
+        if _inference_executor is None:
+            _inference_executor = futures.ThreadPoolExecutor(
+                max_workers=settings.max_concurrent,
+                thread_name_prefix="whisper-infer",
+            )
+        return _inference_executor
+    return None
+
+
+async def _offload(fn: Callable, *args) -> Any:
+    """Run a blocking chunk off the event loop (CTranslate2 releases the GIL).
+
+    Uses the bounded inference pool when WHISPER_MAX_CONCURRENT > 0 (backpressures
+    excess requests by queueing), else starlette's anyio pool for an unbounded
+    thread-per-request model.
+    """
+    pool = _inference_pool()
+    if pool is None:
+        return await run_in_threadpool(fn, *args)
+    return await asyncio.get_running_loop().run_in_executor(pool, fn, *args)
+
+
+def _upload_limit() -> Optional[int]:
+    """Upload cap in bytes (None = unlimited)."""
+    mb = settings.max_upload_mb
+    return mb * 1024 * 1024 if mb > 0 else None
+
+
+def _reject_too_large(size: int, limit: Optional[int]) -> None:
+    if limit is not None and size > limit:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large ({size} bytes > {limit}-byte limit).",
+        )
+
+
+def _check_content_length(header: Optional[str], limit: Optional[int]) -> None:
+    """Fast-path 413 from Content-Length before reading the body."""
+    if limit is None or not header:
+        return
+    try:
+        declared = int(header)
+    except (TypeError, ValueError):
+        return
+    _reject_too_large(declared, limit)
+
+
+async def _write_upload(file: UploadFile, tmp: Any, limit: Optional[int]) -> int:
+    """Stream the upload to disk in 1 MB chunks, 413-ing mid-stream past the cap.
+
+    Returns the number of bytes written. Peak RAM is bounded to ~1 MB per
+    request instead of buffering the whole file.
+    """
+    written = 0
+    while chunk := await file.read(1024 * 1024):
+        written += len(chunk)
+        _reject_too_large(written, limit)
+        tmp.write(chunk)
+    return written
+
+
+def _audio_duration_s(path: str) -> Optional[float]:
+    """Container duration via PyAV metadata (fast; no model load). None if unknown."""
+    try:
+        import av
+
+        container = av.open(path)
+        try:
+            stream = container.streams.audio[0]
+            if stream.duration and stream.time_base:
+                # duration * time_base is a Fraction; coerce to float seconds.
+                return float(stream.duration * stream.time_base)
+        finally:
+            container.close()
+    except Exception:
+        pass
+    return None
+
+
+async def _guard_duration_ok(path: str) -> None:
+    """Reject audio longer than WHISPER_MAX_AUDIO_SECONDS (OpenAI-style 400)."""
+    max_s = settings.max_audio_seconds
+    if max_s and max_s > 0:
+        duration = await _offload(_audio_duration_s, path)
+        if duration is not None and duration > max_s:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Audio file is too long ({duration:.1f}s > {max_s}s).",
+            )
+
+
+async def _maybe_timeout(awaitable: Any, timeout_s: float) -> Any:
+    """Abandon-the-call inference timeout (CTranslate2 cannot be preempted).
+
+    On expiry the scheduler 504s and the worker thread drains the orphaned
+    inference in the bounded pool — no way to kill it mid-flight, so we only
+    stop waiting.
+    """
+    if timeout_s and timeout_s > 0:
+        try:
+            return await asyncio.wait_for(awaitable, timeout=timeout_s)
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                status_code=504,
+                detail=f"Transcription timed out after {timeout_s:g}s.",
+            )
+    return await awaitable
+
+
+def _segment_dict(seg) -> dict:
+    return {
+        "id": seg.id,
+        "seek": seg.seek,
+        "start": seg.start,
+        "end": seg.end,
+        "text": seg.text,
+        "tokens": seg.tokens,
+        "temperature": seg.temperature,
+        "avg_logprob": seg.avg_logprob,
+        "compression_ratio": seg.compression_ratio,
+        "no_speech_prob": seg.no_speech_prob,
+    }
+
+
+def _build_kwargs(
+    language: Optional[str],
+    prompt: Optional[str],
+    temperature: float,
+    task: Optional[str] = None,
+) -> dict:
+    """Shared transcription kwargs (single source of truth for both endpoints)."""
+    kwargs: dict = {
+        "beam_size": 5,
+        "best_of": 5,
+        "condition_on_previous_text": False,
+        "temperature": temperature if temperature is not None else 0.0,
+    }
+    if task:
+        kwargs["task"] = task
+    if language:
+        kwargs["language"] = language
+    if prompt:
+        kwargs["initial_prompt"] = prompt
+    return kwargs
+
+
+def _transcribe_collect(wm: Any, path: str, kwargs: dict) -> tuple:
+    """Blocking unit: transcribe + aggregate segments/text (worker thread)."""
+    segments, info = wm.transcribe(path, **kwargs)
+    segment_list = [_segment_dict(seg) for seg in segments]
+    full_text = "".join(seg["text"] for seg in segment_list).strip()
+    return segment_list, info, full_text
+
+
+# -- OpenAI-style streaming (stream=true) ----------------------------------
+#
+# faster-whisper yields segments lazily, so a producer thread pushes each as it
+# is produced and the SSE generator forwards it. The wire format is best-effort
+# OpenAI-shaped (transcript deltas, transcript.done, [DONE]); verify against a
+# real client before promising strict parity.
+
+
+def _stream_worker(wm: Any, path: str, kwargs: dict, q: "queue.SimpleQueue") -> None:
+    """Producer: ('segment', dict) / ('done', (info, text)) / ('error', msg) / ('end', None)."""
+    try:
+        segments, info = wm.transcribe(path, **kwargs)
+        parts = []
+        for seg in segments:
+            d = _segment_dict(seg)
+            parts.append(d["text"])
+            q.put(("segment", d))
+        q.put(("done", (info, "".join(parts).strip())))
+    except Exception as e:  # surfaced to the client as an SSE error event
+        q.put(("error", repr(e)))
+    finally:
+        q.put(("end", None))
+
+
+async def _sse_stream(wm: Any, path: str, kwargs: dict, task: str):
+    """SSE generator: per-segment deltas, then transcript.done + [DONE]."""
+    q: "queue.SimpleQueue" = queue.SimpleQueue()
+    loop = asyncio.get_running_loop()
+    fut = loop.run_in_executor(_inference_pool(), _stream_worker, wm, path, kwargs, q)
+    try:
+        while True:
+            kind, payload = await run_in_threadpool(q.get)
+            if kind == "segment":
+                seg = payload
+                yield (
+                    "event: transcript\n"
+                    f"data: {json.dumps({'delta': seg['text'], 'timestamp': {'start': seg['start'], 'end': seg['end']}})}\n\n"
+                )
+            elif kind == "done":
+                info, text = payload
+                yield (
+                    "event: transcript.done\n"
+                    f"data: {json.dumps({'text': text, 'language': info.language, 'task': task})}\n\n"
+                    "event: done\ndata: [DONE]\n\n"
+                )
+                break
+            elif kind == "error":
+                yield f"event: error\ndata: {json.dumps({'error': payload})}\n\n"
+                break
+            else:  # 'end' sentinel (defensive; done/error break out first)
+                break
+    finally:
+        # Drain the producer before closing so the pool slot is freed, then
+        # release the temp file the route relinquished to us for streaming.
+        if not fut.done():
+            await fut
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
@@ -521,11 +786,16 @@ async def health():
         "reloads": store.reloads,
         "default_language": settings.default_language,
         "allowed_languages": settings.allowed_languages,
+        "max_concurrent": settings.max_concurrent,
+        "max_upload_mb": settings.max_upload_mb,
+        "max_audio_seconds": settings.max_audio_seconds,
+        "request_timeout_s": settings.request_timeout_s,
     }
 
 
-@app.post("/v1/audio/transcriptions", response_model=TranscriptionResponse)
+@app.post("/v1/audio/transcriptions")
 async def transcribe_audio(
+    request: Request,
     file: UploadFile = File(...),
     # Scalar params must be declared as Form fields — without Form(), FastAPI
     # binds them as query params and silently ignores multipart form values.
@@ -535,6 +805,7 @@ async def transcribe_audio(
     response_format: Optional[str] = Form("json"),
     temperature: Optional[float] = Form(0.0),
     timestamps: Optional[bool] = Form(True),
+    stream: Optional[bool] = Form(False),
 ):
     """
     Transcribe audio into the input language (OpenAI-compatible).
@@ -543,59 +814,52 @@ async def transcribe_audio(
     """
     # Fail fast on unsupported formats, before touching the model (OpenAI: 400).
     fmt = _validate_response_format(response_format)
+    limit = _upload_limit()
+    _check_content_length(request.headers.get("content-length"), limit)
 
     # Record real API demand (never /health), then capture the model into a
     # local ref so a concurrent idle-eviction can't tear it down mid-request.
     store.touch()
-    wm = store.get()
+    wm = await _offload(store.get)
 
-    # 1. Save uploaded file to a temp location
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-        content = await file.read()
-        tmp.write(content)
-        tmp_path = tmp.name
-
+    tmp_path: Optional[str] = None
     try:
-        # 2. Build transcription kwargs
-        kwargs: dict = {
-            "beam_size": 5,
-            "best_of": 5,
-            "condition_on_previous_text": False,
-            "temperature": temperature if temperature is not None else 0.0,
-        }
-        # Client `language` wins; otherwise server defaults/allowlist apply.
-        resolved_language = _resolve_language(wm, tmp_path, language)
-        if resolved_language:
-            kwargs["language"] = resolved_language
-        # Client `prompt` wins; otherwise a server-wide initial prompt applies.
-        # faster-whisper names this kwarg `initial_prompt` (OpenAI calls it `prompt`).
+        # 1. Stream the upload to disk (bounded RAM; 413 mid-stream past cap)
+        #    under a sanitized extension that mirrors the real upload. PyAV
+        #    sniffs the bytes, so the extension is hygiene, not logic.
+        suffix = _safe_suffix(file.filename)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            await _write_upload(file, tmp, limit)
+            tmp_path = tmp.name
+
+        # 2. Reject audio longer than the cap before touching the model.
+        await _guard_duration_ok(tmp_path)
+
+        # 3. Build transcription kwargs. Client `language` wins; otherwise
+        #    server defaults/allowlist apply. Client `prompt` wins; otherwise
+        #    a server-wide initial prompt applies. faster-whisper names the
+        #    prompt kwarg `initial_prompt` (OpenAI calls it `prompt`).
+        resolved_language = await _offload(_resolve_language, wm, tmp_path, language)
         resolved_prompt = prompt or settings.initial_prompt
-        if resolved_prompt:
-            kwargs["initial_prompt"] = resolved_prompt
+        kwargs = _build_kwargs(
+            language=resolved_language,
+            prompt=resolved_prompt,
+            temperature=temperature if temperature is not None else 0.0,
+        )
 
-        # 3. Run inference
-        segments, info = wm.transcribe(tmp_path, **kwargs)
+        # 4. Optional OpenAI-style streaming (SSE); otherwise run inference
+        #    off the event loop with the configured abandon-timeout.
+        if stream:
+            return StreamingResponse(
+                _sse_stream(wm, tmp_path, kwargs, task="transcribe"),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache"},
+            )
 
-        # 4. Collect segments
-        segment_list = []
-        full_text_parts = []
-        for seg in segments:
-            segment_dict = {
-                "id": seg.id,
-                "seek": seg.seek,
-                "start": seg.start,
-                "end": seg.end,
-                "text": seg.text,
-                "tokens": seg.tokens,
-                "temperature": seg.temperature,
-                "avg_logprob": seg.avg_logprob,
-                "compression_ratio": seg.compression_ratio,
-                "no_speech_prob": seg.no_speech_prob,
-            }
-            segment_list.append(segment_dict)
-            full_text_parts.append(seg.text)
-
-        full_text = "".join(full_text_parts).strip()
+        segment_list, info, full_text = await _maybe_timeout(
+            _offload(_transcribe_collect, wm, tmp_path, kwargs),
+            settings.request_timeout_s,
+        )
 
         # 5. Plain-text / subtitle formats return the document itself (OpenAI style)
         if fmt in ("txt", "srt", "vtt"):
@@ -614,20 +878,25 @@ async def transcribe_audio(
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        # For stream=true the temp file is owned by _sse_stream (which unlinks it
+        # after draining); here we only clean up the non-streaming path.
+        if tmp_path and not stream:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
-@app.post("/v1/audio/translations", response_model=TranslationResponse)
+@app.post("/v1/audio/translations")
 async def translate_audio(
+    request: Request,
     file: UploadFile = File(...),
     model: Optional[str] = Form(None),
     prompt: Optional[str] = Form(None),
     response_format: Optional[str] = Form("json"),
     temperature: Optional[float] = Form(0.0),
     timestamps: Optional[bool] = Form(True),
+    stream: Optional[bool] = Form(False),
 ):
     """
     Translate audio into English (OpenAI-compatible).
@@ -635,55 +904,45 @@ async def translate_audio(
     Send the audio as multipart/form-data with the field name `file`.
     """
     fmt = _validate_response_format(response_format)
+    limit = _upload_limit()
+    _check_content_length(request.headers.get("content-length"), limit)
 
     # Record real API demand (never /health), then capture the model into a
     # local ref so a concurrent idle-eviction can't tear it down mid-request.
     store.touch()
-    wm = store.get()
+    wm = await _offload(store.get)
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-        content = await file.read()
-        tmp.write(content)
-        tmp_path = tmp.name
-
+    tmp_path: Optional[str] = None
     try:
-        kwargs: dict = {
-            "beam_size": 5,
-            "best_of": 5,
-            "condition_on_previous_text": False,
-            "temperature": temperature if temperature is not None else 0.0,
-            "task": "translate",
-        }
+        suffix = _safe_suffix(file.filename)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            await _write_upload(file, tmp, limit)
+            tmp_path = tmp.name
+
+        await _guard_duration_ok(tmp_path)
+
         # Server defaults/allowlist steer source-language detection
         # (OpenAI's translations endpoint always translates *to* English).
-        resolved_language = _resolve_language(wm, tmp_path, None)
-        if resolved_language:
-            kwargs["language"] = resolved_language
+        resolved_language = await _offload(_resolve_language, wm, tmp_path, None)
         resolved_prompt = prompt or settings.initial_prompt
-        if resolved_prompt:
-            kwargs["initial_prompt"] = resolved_prompt
+        kwargs = _build_kwargs(
+            language=resolved_language,
+            prompt=resolved_prompt,
+            temperature=temperature if temperature is not None else 0.0,
+            task="translate",
+        )
 
-        segments, info = wm.transcribe(tmp_path, **kwargs)
+        if stream:
+            return StreamingResponse(
+                _sse_stream(wm, tmp_path, kwargs, task="translate"),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache"},
+            )
 
-        segment_list = []
-        full_text_parts = []
-        for seg in segments:
-            segment_dict = {
-                "id": seg.id,
-                "seek": seg.seek,
-                "start": seg.start,
-                "end": seg.end,
-                "text": seg.text,
-                "tokens": seg.tokens,
-                "temperature": seg.temperature,
-                "avg_logprob": seg.avg_logprob,
-                "compression_ratio": seg.compression_ratio,
-                "no_speech_prob": seg.no_speech_prob,
-            }
-            segment_list.append(segment_dict)
-            full_text_parts.append(seg.text)
-
-        full_text = "".join(full_text_parts).strip()
+        segment_list, info, full_text = await _maybe_timeout(
+            _offload(_transcribe_collect, wm, tmp_path, kwargs),
+            settings.request_timeout_s,
+        )
 
         if fmt in ("txt", "srt", "vtt"):
             return _text_response(fmt, segment_list, full_text)
@@ -701,10 +960,12 @@ async def translate_audio(
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        # stream=true -> _sse_stream owns cleanup of the temp file.
+        if tmp_path and not stream:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------

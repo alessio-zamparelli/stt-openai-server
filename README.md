@@ -165,6 +165,10 @@ print(result.text)
 | `WHISPER_LANGUAGE` | *(auto)* | Default language when a request omits `language` (ISO-639-1 code, e.g. `it`). Pinning stabilizes short / low-quality clips |
 | `WHISPER_LANGUAGES` | *(auto)* | Comma-separated allowlist, e.g. `it,en`. A single code is forced for every request; several codes run auto-detection *constrained* to that set (whisper's default detection ignores any allowlist) |
 | `WHISPER_INITIAL_PROMPT` | *(none)* | Prompt applied whenever a request sends none (conditions the decoder, e.g. `The transcript is:`) |
+| `WHISPER_MAX_CONCURRENT` | `2` | Cap on simultaneous in-flight transcriptions. `>0` runs inference in a bounded threadpool (backpressures excess requests); `0` = unbounded. Inference offloads the event loop, so `/health` stays responsive under load. See [Robustness & concurrency](/docs/PLAN-robustness-concurrency.md) |
+| `WHISPER_MAX_UPLOAD_MB` | `100` | Reject uploads whose byte size exceeds this (`413`, mid-stream; `0` = unlimited). Streams to disk in 1 MB chunks so RAM stays flat |
+| `WHISPER_MAX_AUDIO_SECONDS` | `3600` | Reject audio longer than this in container duration — OpenAI-style `400` *before* the model runs (`0` = off). Whisper processes audio in fixed ~30 s windows, so very long inputs cost multiples of the per-window floor |
+| `WHISPER_REQUEST_TIMEOUT_S` | `300` | Abandon-the-call timeout → `504` if inference exceeds it (`0` = off). CT2 can't be preempted, so the orphan drains in the bounded pool |
 | `HF_HOME` | `/data/hf` (container) | Where model weights are downloaded/cached |
 
 > 💡 **Priority for `language`**: per-request `language` field → `WHISPER_LANGUAGE`
