@@ -20,6 +20,7 @@ import wave
 from pathlib import Path
 
 import httpx
+# pi-lens-ignore: reportMissingImports
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent

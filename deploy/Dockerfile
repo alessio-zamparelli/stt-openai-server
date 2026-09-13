@@ -11,6 +11,9 @@
 # so we ship only the pre-built .venv. Both stages are bookworm so the
 # venv's python symlinks resolve identically.
 #
+# Guide patterns applied: bind-mounted manifest files (no lockfile layer),
+# UV_COMPILE_BYTECODE, cache mounts, --no-editable, .venv via .dockerignore.
+#
 # CPU-only by design: faster-whisper runs on CTranslate2's CPU backend with
 # INT8 quantization — no CUDA/NVIDIA layers, no torch wheels.
 #
@@ -31,10 +34,12 @@ ENV UV_PYTHON_DOWNLOADS=0 \
 
 WORKDIR /app
 
-# Layer 1 — install ALL locked dependencies without the project. This layer is
-# cached and only invalidates when pyproject.toml / uv.lock change.
-COPY pyproject.toml uv.lock ./
+# Layer 1 — install ALL locked dependencies without the project. Manifest
+# files are bind-mounted per the uv guide's canonical pattern: they never
+# enter an image layer, and this RUN's cache invalidates only when they change.
 RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    --mount=type=bind,source=uv.lock,target=uv.lock \
     uv sync --locked --no-install-project --no-dev --no-editable
 
 ###############################################################################

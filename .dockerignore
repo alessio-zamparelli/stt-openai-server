@@ -1,0 +1,17 @@
+# Keep the local virtual environment out of the build context — best practice
+# per https://docs.astral.sh/uv/guides/integration/docker/ ("Installing a project"):
+# the project venv is platform-dependent and must be created from scratch in the image.
+.venv/
+
+# Not needed in the image build context
+.git/
+.github/
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+tests/
+docker-compose.yml
+pyrightconfig.json
+.env
