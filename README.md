@@ -177,6 +177,42 @@ print(result.text)
 | `WHISPER_VAD` | `false` | Pre-filter silence with Silero-VAD before transcription. Helps sparse / quiet audio; on all-speech clips it is a *net cost* (adds a full VAD pass). |
 | `WHISPER_HF_OFFLINE` | `false` | Load the model with `local_files_only=True` — never touch the Hugging Face hub (no revalidation round-trips). Fails fast if weights aren't already in `HF_HOME` |
 | `HF_HOME` | `/data/hf` (container) | Where model weights are downloaded/cached |
+| `HF_HUB_OFFLINE` | *(unset)* | Library-level companion to `WHISPER_HF_OFFLINE`: `1` makes `huggingface_hub` refuse network calls entirely (air-gapped deploys / tests). faster-whisper also honors it |
+
+### Env template (all optional, commented)
+
+Uncomment the knobs you need; values are examples (defaults are in the table above).
+
+```sh
+# --- server / model ---
+# WHISPER_MODEL_NAME=base
+# WHISPER_COMPUTE_TYPE=int8
+# WHISPER_DEVICE=cpu
+# WHISPER_HOST=0.0.0.0
+# WHISPER_PORT=8080
+# WHISPER_LAZY_LOAD=false
+# WHISPER_IDLE_UNLOAD_S=300
+# WHISPER_IDLE_POLL_S=30
+# --- language / decoding ---
+# WHISPER_LANGUAGE=it
+# WHISPER_LANGUAGES=it,en
+# WHISPER_INITIAL_PROMPT=The transcript is:
+# WHISPER_BEAM_SIZE=5
+# WHISPER_BEST_OF=5
+# WHISPER_TEMPERATURES=0,0.2,0.4
+# WHISPER_CPU_THREADS=2
+# WHISPER_BATCH_SIZE=4
+# WHISPER_VAD=true
+# --- robustness / resources ---
+# WHISPER_MAX_CONCURRENT=2
+# WHISPER_MAX_UPLOAD_MB=100
+# WHISPER_MAX_AUDIO_SECONDS=3600
+# WHISPER_REQUEST_TIMEOUT_S=300
+# --- cache / offline ---
+# WHISPER_HF_OFFLINE=true
+# HF_HOME=/data/hf
+# HF_HUB_OFFLINE=1
+```
 
 > 💡 **Priority for `language`**: per-request `language` field → `WHISPER_LANGUAGE`
 > → `WHISPER_LANGUAGES` (single forced / multi constrained-detect) → faster-whisper
