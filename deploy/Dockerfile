@@ -84,7 +84,11 @@ VOLUME ["/data"]
 USER whisper
 EXPOSE 8080
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 \
-    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=4).read()"]
+# The eager model load happens inside FastAPI's lifespan startup, before
+# uvicorn binds the port. The first boot therefore answers "connection
+# refused" until the ~140 MB model download finishes, so allow a generous
+# start period (the probe itself honors WHISPER_PORT inside app.py).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=600s --retries=3 \
+    CMD ["python", "app.py", "--healthcheck"]
 
 ENTRYPOINT ["python", "app.py"]

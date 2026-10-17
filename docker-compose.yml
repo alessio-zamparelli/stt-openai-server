@@ -73,10 +73,14 @@ services:
       - whisper-data:/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=4).read()"]
+      # app.py --healthcheck honors WHISPER_PORT and bypasses HTTP proxies.
+      test: ["CMD", "python", "app.py", "--healthcheck"]
       interval: 30s
       timeout: 5s
-      start_period: 180s
+      # The first boot downloads the model before uvicorn binds the port, so
+      # probes log "connection refused" until that finishes; do not count
+      # those as failures for the first 10 minutes.
+      start_period: 600s
       retries: 3
 
 volumes:

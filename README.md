@@ -48,6 +48,13 @@ docker compose up -d --build
 
 > ℹ️ The first startup downloads the `base` model (~140 MB int8) into the
 > `whisper-data` volume — subsequent restarts are instant.
+>
+> ⏳ The model is loaded eagerly inside FastAPI's lifespan startup, before
+> uvicorn binds the port. While that first download runs, the container stays
+> in Docker's `starting` state and health probes may log `Connection refused`;
+> this is expected. The built-in healthcheck allows a 10-minute cold start. On
+> very slow links set `WHISPER_LAZY_LOAD=true` so the server binds immediately
+> and loads the model on the first request instead.
 
 ### Option 2 — Docker (one-liner)
 
@@ -370,7 +377,7 @@ Measured against real TTS clips (0.3–2 s), the biggest accuracy lever is
 ## 🐳 Production notes
 
 - **Model cache** — mount `/data` (HF weights persist; restarts don't re-download)
-- **Healthcheck** — built-in `HEALTHCHECK` hits `/health` every 30 s
+- **Healthcheck** — built-in `HEALTHCHECK` runs `python app.py --healthcheck` every 30 s (honors `WHISPER_PORT`, bypasses HTTP proxies, 10-minute cold-start grace for the first model download)
 - **Non-root** — container runs as uid `10001`
 - **Scaling** — the model is loaded per process; scale horizontally with `docker compose --scale whisper=N` behind a reverse proxy
 - **One resident model per host** — each loaded `base`/int8 model holds ~450 MB RAM for its whole request, and inference on it is **serialized**, so concurrent requests *queue* rather than run in parallel; running several whisper containers on one box means **cold-start contention of 3–4 s per load (plus queued decode time while a request holds the model) is an ops problem, not a server one**. Prefer fewer, larger instances (or batching) over many small ones; with serialized decodes size `WHISPER_CPU_THREADS` ≈ cores and use `WHISPER_MAX_CONCURRENT` to cap the queue. See [Latency tuning](#latency-tuning) for the measured baseline/probes and [PLAN-performance](docs/PLAN-performance.md) for the per-stage timings exposed at `/health`

@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import queue
+import sys
 import tempfile
 import threading
 import time
@@ -1155,6 +1156,37 @@ async def translate_audio(
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _healthcheck() -> int:
+    """One-shot probe used by the container HEALTHCHECK (`app.py --healthcheck`).
+
+    Uses ``http.client`` instead of ``urllib`` so a loopback probe is never
+    routed through an HTTP(S) proxy from the container environment, honors
+    ``WHISPER_PORT``/``WHISPER_HOST`` (including a 0.0.0.0 bind), and prints a
+    single line instead of a full traceback while the model is still
+    downloading during Docker's start period.
+    """
+    import http.client
+
+    host = "127.0.0.1" if settings.host in ("", "0.0.0.0", "::") else settings.host
+    conn = None
+    try:
+        conn = http.client.HTTPConnection(host, settings.port, timeout=4)
+        conn.request("GET", "/health")
+        response = conn.getresponse()
+        response.read()
+        return 0 if response.status == 200 else 1
+    except Exception as exc:  # ConnectionRefusedError while uvicorn is not bound yet
+        print(
+            f"healthcheck: {host}:{settings.port} not ready "
+            f"({type(exc).__name__}: {exc})",
+            file=sys.stderr,
+        )
+        return 1
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def main():
     import uvicorn
 
@@ -1172,4 +1204,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if "--healthcheck" in sys.argv[1:]:
+        raise SystemExit(_healthcheck())
     main()
