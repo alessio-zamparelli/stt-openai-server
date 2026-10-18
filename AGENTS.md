@@ -41,7 +41,7 @@ uv run python -m pytest tests/test_tuning.py::test_route_forwards_beam_and_sched
 - Inference uses one shared model. `transcribe()` is not safe concurrently on one instance, so calls are serialized with `_inference_lock`; `WHISPER_MAX_CONCURRENT` bounds the queue, not parallel decodes. Preserve the lock and `ModelStore` single-flight load/eviction behavior.
 - `/health` deliberately does **not** call `store.touch()`; this prevents monitoring traffic from defeating idle eviction. Do not "fix" it.
 - The request `model` field is accepted for OpenAI compatibility but ignored; the served model is always `settings.model_name`.
-- Uploads are streamed to a temp file, duration/size limits are enforced before inference, and temp files are deleted on both streaming and non-streaming paths. Keep cleanup symmetric when editing routes.
+- Uploads are buffered by Starlette into an `UploadFile` (`SpooledTemporaryFile`) before the route runs; routes pass that file-like object straight to PyAV/faster-whisper (no second temp copy). Size/duration limits are enforced before inference, and the upload is closed on both streaming and non-streaming paths. Keep cleanup symmetric when editing routes.
 
 ## Docker and CI
 

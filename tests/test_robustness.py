@@ -27,7 +27,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app as app_module
-from app import ModelStore, Settings, _check_content_length, _safe_suffix
+from app import ModelStore, Settings, _check_content_length
 
 
 # --------------------------------------------------------------------------
@@ -45,9 +45,11 @@ class FakeModel:
         self.segments = segments or []
         self.lag = lag
         self.transcribe_kwargs: List[dict] = []
+        self.audios: List[Any] = []
         self.supported_languages = {"en", "it", "de", "es", "fr", "pt"}
 
     def transcribe(self, audio, **kwargs):
+        self.audios.append(audio)
         self.transcribe_kwargs.append(dict(kwargs))
         if self.lag:
             import time as _t
@@ -103,18 +105,8 @@ def _wav(seconds: float, rate: int = 16000, channels: int = 1, bits: int = 16) -
 
 
 # --------------------------------------------------------------------------
-# Phase 1 — suffix preservation + upload size cap (unit-level helpers)
+# Phase 1 — buffered upload + size cap (unit-level helpers)
 # --------------------------------------------------------------------------
-
-def test_safe_suffix_mapping():
-    assert _safe_suffix("k.MP3") == ".mp3"
-    assert _safe_suffix("k.wav") == ".wav"
-    assert _safe_suffix("a.flac") == ".flac"
-    assert _safe_suffix(None) == ".bin"
-    assert _safe_suffix("noext") == ".bin"
-    assert _safe_suffix("a.txt") == ".bin"  # not in the allowed codec set
-    assert _safe_suffix("a.tar.gz") == ".bin"  # last suffix not allowed
-
 
 def test_check_content_length_fast_path_413():
     with pytest.raises(Exception) as exc:
@@ -126,10 +118,10 @@ def test_check_content_length_fast_path_413():
     _check_content_length("50", 100)
 
 
-def test_route_mp3_suffix_accepts_upload():
-    # The route forwards a safe .mp3 suffix to the temp file; with a fake
-    # model there's no decode, but it proves the suffix path doesn't crash.
-    # (Real byte-sniffing decode is covered by the live-server e2e.)
+def test_route_hands_buffered_upload_to_model():
+    # The route passes Starlette's buffered upload directly to the model: no
+    # second temp-file copy and no suffix-dependent path. (Real byte-sniffing
+    # decode is covered by the live-server e2e.)
     model = FakeModel(segments=[_seg(0, "hello")])
     cfg = Settings(idle_unload_s=0)
     with _make_client(_make_store(model), cfg) as c:
@@ -139,10 +131,74 @@ def test_route_mp3_suffix_accepts_upload():
         )
     assert r.status_code == 200
     assert r.json()["text"] == "hello"
+    audio = model.audios[-1]
+    assert not isinstance(audio, str)
+    assert hasattr(audio, "read") and hasattr(audio, "seek")
 
 
 # --------------------------------------------------------------------------
-# Phase 1 — 413 upload cap (mid-stream + content-length)
+# Text-only fast path (text / timestamps=false)
+# --------------------------------------------------------------------------
+
+def test_text_format_skips_timestamps_and_segments():
+    model = FakeModel(segments=[_seg(0, "Hello "), _seg(1, "world.")])
+    cfg = Settings(idle_unload_s=0)
+    with _make_client(_make_store(model), cfg) as c:
+        r = c.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("t.wav", _wav(0.3), "audio/wav")},
+            data={"response_format": "text"},
+        )
+    assert r.status_code == 200
+    assert r.text == "Hello world."
+    assert model.transcribe_kwargs[-1]["without_timestamps"] is True
+
+
+def test_json_timestamps_false_skips_segments():
+    model = FakeModel(segments=[_seg(0, "Hello")])
+    cfg = Settings(idle_unload_s=0)
+    with _make_client(_make_store(model), cfg) as c:
+        r = c.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("t.wav", _wav(0.3), "audio/wav")},
+            data={"timestamps": "false"},
+        )
+    assert r.status_code == 200
+    assert r.json()["segments"] is None
+    assert model.transcribe_kwargs[-1]["without_timestamps"] is True
+
+
+def test_transcribe_collect_skips_segment_dicts_for_text():
+    """collect_segments=False must only touch .text (no token/segment dicts)."""
+    class _MinimalSeg:
+        text = " hello"
+
+    class _Runner:
+        def transcribe(self, audio, **kwargs):
+            return iter([_MinimalSeg(), _MinimalSeg()]), Info("en")
+
+    segments, _info, text = app_module._transcribe_collect(
+        _Runner(), "/tmp/probe.wav", {}, collect_segments=False
+    )
+    assert segments == []
+    assert text == "hello hello"
+
+
+def test_json_default_keeps_timestamps():
+    model = FakeModel(segments=[_seg(0, "Hello")])
+    cfg = Settings(idle_unload_s=0)
+    with _make_client(_make_store(model), cfg) as c:
+        r = c.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("t.wav", _wav(0.3), "audio/wav")},
+        )
+    assert r.status_code == 200
+    assert len(r.json()["segments"]) == 1
+    assert model.transcribe_kwargs[-1]["without_timestamps"] is False
+
+
+# --------------------------------------------------------------------------
+# Phase 1 — 413 upload cap (buffered size + Content-Length)
 # --------------------------------------------------------------------------
 
 def test_upload_exceeds_cap_returns_413():

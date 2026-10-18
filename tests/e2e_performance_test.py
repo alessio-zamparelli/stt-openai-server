@@ -154,11 +154,13 @@ def test_default_health_keeps_accuracy_first_defaults(client_responsive):
     assert body["temperature_schedule"] is None
     assert body["cpu_threads"] == 0
     assert body["batch_size"] == 0
+    assert body["batch_min_seconds"] == 0
 
 
 def test_batched_health_reports_batch_size(client_batched):
     body = client_batched.get("/health").json()
     assert body["batch_size"] == 4
+    assert body["batch_min_seconds"] == 0
     assert body["beam_size"] == 5  # tuning defaults unchanged, batched is independent
 
 

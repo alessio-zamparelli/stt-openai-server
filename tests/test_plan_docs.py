@@ -76,7 +76,8 @@ def test_settings_field_surface_covers_latency_knobs():
 
     needed = {
         "beam_size", "best_of", "temperature_schedule", "cpu_threads",
-        "batch_size", "vad_filter", "hf_offline", "max_concurrent",
+        "batch_size", "batch_min_seconds", "vad_filter", "hf_offline",
+        "max_concurrent",
     }
     missing = needed - set(app_module.Settings.model_fields)
     assert not missing, f"Settings missing health-reported fields: {missing}"

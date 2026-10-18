@@ -103,10 +103,21 @@ def _safe_suffix(filename: str | None) -> str:
   any tool that trusts the extension; `.bin` (not `.wav`) avoids implying a codec.
 - Temp name: `NamedTemporaryFile(delete=False, prefix="whisper-", suffix=_safe_suffix(...))`.
 
+> **Superseded by the single-request latency pass:** the routes now hand
+> Starlette's already-buffered `UploadFile` (a `SpooledTemporaryFile`) directly
+> to PyAV/faster-whisper. The second temp copy, `_write_upload`, and
+> `_safe_suffix` were removed. The size cap is still enforced from
+> `Content-Length` at route entry and from `UploadFile.size` before inference,
+> and the upload is closed in `finally` (or after the SSE producer drains).
+> Note the framework buffers the multipart body before the route runs, so the
+> old mid-stream copy never bounded peak RAM anyway — it only avoided the
+> duplicate disk write/read.
+
 ### Phase-1 tests
 
-- unit: `_safe_suffix` (valid/absent/weird/uppercase); size-cap abort mid-stream
-  using a fake `UploadFile`; `Content-Length` fast-path 413.
+- unit (historical): `_safe_suffix` / mid-stream-copy tests were removed with
+  the temp copy. The size cap is now covered via `UploadFile.size` plus the
+  `Content-Length` fast-path 413.
 - e2e (real server): upload > cap → **413**; valid 11 s jfk still 200; `/health`
   returns < 1 s while a long transcription runs; a `.mp3`-suffixed upload (real
   MP3, encoded in-test via PyAV) still transcribes.

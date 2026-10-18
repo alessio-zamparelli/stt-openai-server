@@ -27,7 +27,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app as app_module
-from app import ModelStore, Settings, _resolve_language, _split_allowed_languages
+from app import (
+    ModelStore,
+    Settings,
+    _decode_audio_prefix,
+    _resolve_language,
+    _split_allowed_languages,
+)
 
 
 # --------------------------------------------------------------------------
@@ -137,6 +143,24 @@ def test_multi_allowlist_constrains_detection(wav_path):
     assert model.detect_called == 1
 
 
+def test_multi_allowlist_uses_capped_prefix_decode(monkeypatch, wav_path):
+    """Constrained detection must use the 30 s prefix decoder, not a full decode."""
+    sentinel = np.array([0.1, 0.2, 0.3], dtype=np.float32)
+    captured = {}
+
+    class Model(FakeModel):
+        def detect_language(self, audio):
+            captured["audio"] = audio
+            return super().detect_language(audio)
+
+    monkeypatch.setattr(
+        app_module, "settings", Settings(allowed_languages="it,en")
+    )
+    monkeypatch.setattr(app_module, "_decode_audio_prefix", lambda audio: sentinel)
+    assert _resolve_language(Model(), wav_path, None) == "en"  # best allowed
+    np.testing.assert_array_equal(captured["audio"], sentinel)
+
+
 def test_multi_allowlist_no_match_returns_none(wav_path):
     model = FakeModel(detect_scores=[("de", 0.9), ("fr", 0.1)])
     app_module.settings = Settings(allowed_languages="it,en")
@@ -144,6 +168,38 @@ def test_multi_allowlist_no_match_returns_none(wav_path):
         assert _resolve_language(model, wav_path, None) is None
     finally:
         app_module.settings = Settings()
+
+
+def test_decode_audio_prefix_matches_full_decode(tmp_path):
+    """The capped decoder produces the same samples as decode_audio()."""
+    from faster_whisper.audio import decode_audio
+
+    p = tmp_path / "two.wav"
+    p.write_bytes(_sine_wav(seconds=2.0))
+    full = decode_audio(str(p))
+    prefix = _decode_audio_prefix(str(p))
+    assert prefix is not None and prefix.size > 0
+    n = min(full.size, prefix.size)
+    assert np.max(np.abs(full[:n] - prefix[:n])) == 0.0
+
+
+def test_decode_audio_prefix_caps_at_language_window(tmp_path):
+    """A 31 s upload decodes only the 30 s detection window."""
+    from faster_whisper.audio import decode_audio
+
+    p = tmp_path / "long.wav"
+    p.write_bytes(_sine_wav(seconds=31.0, rate=8000))
+    full = decode_audio(str(p))
+    prefix = _decode_audio_prefix(str(p))
+    assert full.size == 31 * 16000
+    assert prefix is not None
+    assert prefix.size == int(app_module._LANGUAGE_DETECT_SECONDS * 16000)
+
+
+def test_decode_audio_prefix_returns_none_for_invalid(tmp_path):
+    p = tmp_path / "bad.bin"
+    p.write_bytes(b"not audio")
+    assert _decode_audio_prefix(str(p)) is None
 
 
 def test_no_language_config_returns_none(monkeypatch):

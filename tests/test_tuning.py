@@ -95,6 +95,15 @@ def test_build_kwargs_bad_schedule_falls_back_to_scalar(monkeypatch):
     assert kw["temperature"] == 0.7
 
 
+def test_build_kwargs_without_timestamps():
+    kw = _build_kwargs(language=None, prompt=None, temperature=0.0)
+    assert kw["without_timestamps"] is False
+    kw = _build_kwargs(
+        language=None, prompt=None, temperature=0.0, without_timestamps=True
+    )
+    assert kw["without_timestamps"] is True
+
+
 # -- loader wiring ----------------------------------------------------------
 
 
@@ -202,6 +211,35 @@ def test_build_kwargs_batched_adds_batch_size(monkeypatch):
     assert "batch_size" not in kw_off
 
 
+def test_build_kwargs_batched_forces_vad_filter(monkeypatch):
+    """BatchedInferencePipeline needs VAD (or clip_timestamps) to chunk audio;
+    WHISPER_VAD only governs the sequential path."""
+    for vad in (False, True):
+        monkeypatch.setattr(
+            app_module, "settings", Settings(batch_size=4, vad_filter=vad)
+        )
+        kw = _build_kwargs(
+            language=None, prompt=None, temperature=0.0, batched=True
+        )
+        assert kw["vad_filter"] is True
+
+
+def test_build_runner_respects_batch_min_seconds(monkeypatch):
+    monkeypatch.setattr("faster_whisper.BatchedInferencePipeline", _FakeBP)
+    model = FakeModel()
+    monkeypatch.setattr(
+        app_module, "settings", Settings(batch_size=4, batch_min_seconds=30)
+    )
+    assert app_module._build_runner(model, duration=None) is model
+    assert app_module._build_runner(model, duration=10.0) is model
+    assert isinstance(app_module._build_runner(model, duration=30.0), _FakeBP)
+    # batch_min_seconds=0 keeps the old "always batch" behaviour.
+    monkeypatch.setattr(
+        app_module, "settings", Settings(batch_size=4, batch_min_seconds=0)
+    )
+    assert isinstance(app_module._build_runner(model, duration=10.0), _FakeBP)
+
+
 def test_route_uses_batched_runner(monkeypatch):
     monkeypatch.setattr(app_module, "settings", Settings(batch_size=4))
     monkeypatch.setattr("faster_whisper.BatchedInferencePipeline", _FakeBP)
@@ -216,6 +254,27 @@ def test_route_uses_batched_runner(monkeypatch):
         resp.json()
     kw = model.transcribe_kwargs[-1]
     assert kw["batch_size"] == 4
+
+
+def test_route_adapts_batching_to_duration(monkeypatch):
+    """WHISPER_BATCH_MIN_SECONDS: long clips batch, short clips stay sequential."""
+    monkeypatch.setattr("faster_whisper.BatchedInferencePipeline", _FakeBP)
+    model = FakeModel()
+    cfg = Settings(batch_size=4, batch_min_seconds=1)
+    with _client(cfg, model) as (client, _):
+        long_resp = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("long.wav", _make_wav(2.0), "audio/wav")},
+        )
+        assert long_resp.status_code == 200
+        assert model.transcribe_kwargs[-1]["batch_size"] == 4
+
+        short_resp = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("short.wav", _make_wav(0.5), "audio/wav")},
+        )
+        assert short_resp.status_code == 200
+        assert "batch_size" not in model.transcribe_kwargs[-1]
 
 
 def test_translate_route_uses_batched_runner(monkeypatch):
@@ -240,3 +299,10 @@ def test_health_reports_batch_size():
         assert client.get("/health").json()["batch_size"] == 4
     with _client(Settings(), FakeModel()) as (client, _):
         assert client.get("/health").json()["batch_size"] == 0
+
+
+def test_health_reports_batch_min_seconds():
+    with _client(Settings(batch_min_seconds=30), FakeModel()) as (client, _):
+        assert client.get("/health").json()["batch_min_seconds"] == 30
+    with _client(Settings(), FakeModel()) as (client, _):
+        assert client.get("/health").json()["batch_min_seconds"] == 0

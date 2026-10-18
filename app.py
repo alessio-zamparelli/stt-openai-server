@@ -14,13 +14,11 @@ import logging
 import os
 import queue
 import sys
-import tempfile
 import threading
 import time
 from collections import defaultdict, deque
 from concurrent import futures
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import Any, Callable, List, Optional
 
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request
@@ -64,6 +62,9 @@ class Settings(BaseModel):
     temperature_schedule: str = ""  # WHISPER_TEMPERATURES e.g. "0,0.2,0.4" ("" = fw default)
     cpu_threads: int = 0  # WHISPER_CPU_THREADS (0 = faster-whisper default)
     batch_size: int = 0  # WHISPER_BATCH_SIZE (0 = sequential; >0 = batched pipeline)
+    # With batch_size > 0, batch only clips at least this long (0 = always batch).
+    # Unknown duration falls back to sequential (docs/PLAN-performance.md Phase 2).
+    batch_min_seconds: int = 0  # WHISPER_BATCH_MIN_SECONDS
     vad_filter: bool = False  # WHISPER_VAD (enable VAD pre-filtering at transcribe time)
     hf_offline: bool = False  # WHISPER_HF_OFFLINE (local_files_only on model load)
 
@@ -112,6 +113,7 @@ settings = Settings(
     temperature_schedule=os.getenv("WHISPER_TEMPERATURES", "").strip(),
     cpu_threads=_env_int("WHISPER_CPU_THREADS", 0),
     batch_size=_env_int("WHISPER_BATCH_SIZE", 0),
+    batch_min_seconds=_env_int("WHISPER_BATCH_MIN_SECONDS", 0),
     vad_filter=_env_bool("WHISPER_VAD", False),
     hf_offline=_env_bool("WHISPER_HF_OFFLINE", False),
 )
@@ -475,7 +477,64 @@ def _check_language(code: Optional[str], supported: Optional[set]) -> Optional[s
     return code
 
 
-def _resolve_language(model: Any, audio_path: str, requested: Optional[str]) -> Optional[str]:
+_LANGUAGE_DETECT_SECONDS = 30.0  # one Whisper encoder window
+
+
+def _decode_audio_prefix(
+    audio: Any, max_seconds: float = _LANGUAGE_DETECT_SECONDS
+) -> Optional[Any]:
+    """Decode only the prefix needed for language detection (mono f32 @16 kHz).
+
+    ``detect_language`` reads at most one 30 s window, but
+    ``faster_whisper.audio.decode_audio`` decodes the whole upload. This mirrors
+    its PyAV resampling and stops as soon as enough samples are buffered, so a
+    long file no longer pays a second full decode before inference.
+
+    Returns None when no audio could be decoded (caller falls back to
+    faster-whisper's own detection during ``transcribe``).
+    """
+    import av
+    import numpy as np
+
+    sampling_rate = 16000
+    max_samples = int(max_seconds * sampling_rate)
+    resampler = av.audio.resampler.AudioResampler(
+        format="s16", layout="mono", rate=sampling_rate
+    )
+    chunks = []
+    seen = 0
+    try:
+        _seek_start(audio)
+        with av.open(audio, mode="r", metadata_errors="ignore") as container:
+            frames = iter(container.decode(audio=0))
+            while seen < max_samples:
+                try:
+                    frame = next(frames)
+                except StopIteration:
+                    break
+                except av.error.InvalidDataError:  # mirror faster-whisper
+                    continue
+                frame.pts = None  # ignore timestamp checks
+                for resampled in resampler.resample(frame):
+                    array = resampled.to_ndarray()
+                    chunks.append(array)
+                    seen += array.size
+    except Exception:
+        logger.debug("language prefix decode failed", exc_info=True)
+        return None
+    finally:
+        # Release resampler internals without waiting for a full GC pass
+        # (same workaround as faster_whisper.audio.decode_audio).
+        del resampler
+        gc.collect()
+
+    if not chunks:
+        return None
+    samples = np.concatenate([chunk.ravel() for chunk in chunks])[:max_samples]
+    return samples.astype(np.float32) / 32768.0
+
+
+def _resolve_language(model: Any, audio: Any, requested: Optional[str]) -> Optional[str]:
     """Resolve the `language` hint forwarded to faster-whisper.
 
     Priority:
@@ -505,12 +564,14 @@ def _resolve_language(model: Any, audio_path: str, requested: Optional[str]) -> 
         # Validate the whole allowlist up front for a clear 400.
         for code in allowed:
             _check_language(code, supported)
-        # Constrained detection needs decoded audio; faster-whisper returns the
-        # full ranked list, so we can ignore every code outside the allowlist.
-        from faster_whisper.audio import decode_audio
-
-        audio = decode_audio(audio_path)
-        _code, _prob, all_scores = model.detect_language(audio)
+        # Constrained detection needs only the first 30 s window; faster-whisper
+        # returns the full ranked list, so we can ignore every code outside the
+        # allowlist. Serialize the encoder pass on the same lock as transcribe().
+        samples = _decode_audio_prefix(audio)
+        if samples is None or not samples.size:
+            return None  # undecodable prefix -> let transcribe() auto-detect
+        with _inference_lock:
+            _code, _prob, all_scores = model.detect_language(samples)
         best: Optional[tuple] = None
         for code, prob in all_scores:
             candidate = code.strip().lower()
@@ -533,19 +594,14 @@ def _text_response(fmt: str, segment_list, full_text: str) -> PlainTextResponse:
 # Robustness helpers (docs/PLAN-robustness-concurrency.md)
 # ---------------------------------------------------------------------------
 
-# Temp-file suffixes we pass through. PyAV probes the container from the bytes
-# (never trusts the extension); mapping real suffixes is hygiene for anything
-# downstream that does trust it.
-_ALLOWED_SUFFIXES = {
-    ".wav", ".mp3", ".flac", ".m4a", ".ogg", ".opus", ".aac", ".wma",
-    ".webm", ".mp4", ".avi", ".mov", ".mkv", ".amr", ".3gp", ".aiff",
-}
-
-
-def _safe_suffix(filename: Optional[str]) -> str:
-    """Sanitized, whitelisted extension for the temp copy of an upload."""
-    ext = (Path(filename or "").suffix or "").lower()
-    return ext if ext in _ALLOWED_SUFFIXES else ".bin"
+# Uploads are handed to faster-whisper as Starlette's buffered ``UploadFile``
+# (a SpooledTemporaryFile) instead of being copied to a second temp file. PyAV
+# probes the container from the bytes, so no sanitized suffix is needed.
+def _seek_start(audio: Any) -> None:
+    """Rewind a file-like upload before a blocking probe/decode (no-op for paths)."""
+    seek = getattr(audio, "seek", None)
+    if seek is not None:
+        seek(0)
 
 
 _inference_executor: Optional[futures.ThreadPoolExecutor] = None
@@ -675,26 +731,13 @@ def _check_content_length(header: Optional[str], limit: Optional[int]) -> None:
     _reject_too_large(declared, limit)
 
 
-async def _write_upload(file: UploadFile, tmp: Any, limit: Optional[int]) -> int:
-    """Stream the upload to disk in 1 MB chunks, 413-ing mid-stream past the cap.
-
-    Returns the number of bytes written. Peak RAM is bounded to ~1 MB per
-    request instead of buffering the whole file.
-    """
-    written = 0
-    while chunk := await file.read(1024 * 1024):
-        written += len(chunk)
-        _reject_too_large(written, limit)
-        tmp.write(chunk)
-    return written
-
-
-def _audio_duration_s(path: str) -> Optional[float]:
+def _audio_duration_s(audio: Any) -> Optional[float]:
     """Container duration via PyAV metadata (fast; no model load). None if unknown."""
     try:
         import av
 
-        container = av.open(path)
+        _seek_start(audio)
+        container = av.open(audio, mode="r", metadata_errors="ignore")
         try:
             stream = container.streams.audio[0]
             if stream.duration and stream.time_base:
@@ -703,20 +746,26 @@ def _audio_duration_s(path: str) -> Optional[float]:
         finally:
             container.close()
     except Exception:
-        logger.debug("duration probe failed for %s", path, exc_info=True)
+        logger.debug("duration probe failed for %s", audio, exc_info=True)
     return None
 
 
-async def _guard_duration_ok(path: str) -> None:
-    """Reject audio longer than WHISPER_MAX_AUDIO_SECONDS (OpenAI-style 400)."""
+async def _guard_duration_ok(audio: Any, probe: bool = False) -> Optional[float]:
+    """Enforce WHISPER_MAX_AUDIO_SECONDS and return the probed duration.
+
+    ``probe`` requests the duration even when the guard is disabled (adaptive
+    batching needs it). Returns None when not probed or PyAV cannot tell.
+    """
     max_s = settings.max_audio_seconds
-    if max_s and max_s > 0:
-        duration = await _offload(_audio_duration_s, path)
-        if duration is not None and duration > max_s:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Audio file is too long ({duration:.1f}s > {max_s}s).",
-            )
+    if not (max_s and max_s > 0) and not probe:
+        return None
+    duration = await _offload(_audio_duration_s, audio)
+    if max_s and max_s > 0 and duration is not None and duration > max_s:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Audio file is too long ({duration:.1f}s > {max_s}s).",
+        )
+    return duration
 
 
 async def _maybe_timeout(awaitable: Any, timeout_s: float) -> Any:
@@ -775,6 +824,7 @@ def _build_kwargs(
     temperature: float,
     task: Optional[str] = None,
     batched: bool = False,
+    without_timestamps: bool = False,
 ) -> dict:
     """Shared transcription kwargs (single source of truth for both endpoints)."""
     kwargs: dict = {
@@ -782,6 +832,9 @@ def _build_kwargs(
         "best_of": settings.best_of,
         "condition_on_previous_text": False,
         "temperature": temperature if temperature is not None else 0.0,
+        # Text-only requests (text / timestamps=false) skip timestamp-token
+        # prediction. Batched mode defaults this to true, so pass it explicitly.
+        "without_timestamps": without_timestamps,
     }
     # A server-wide fallback schedule (WHISPER_TEMPERATURES) replaces the
     # per-request scalar when set — documented tradeoff, PLAN-performance 1B.
@@ -790,7 +843,11 @@ def _build_kwargs(
         kwargs["temperature"] = schedule
     if batched:
         kwargs["batch_size"] = settings.batch_size
-    if settings.vad_filter:
+        # BatchedInferencePipeline needs VAD (or clip_timestamps) to find speech
+        # chunks; without it transcribe() raises. Its default is True, so pass it
+        # explicitly: WHISPER_VAD only controls the sequential path.
+        kwargs["vad_filter"] = True
+    elif settings.vad_filter:
         kwargs["vad_filter"] = True
     if task:
         kwargs["task"] = task
@@ -801,31 +858,60 @@ def _build_kwargs(
     return kwargs
 
 
-def _build_runner(wm: Any) -> Any:
-    """Model or opt-in BatchedInferencePipeline wrapper (WHISPER_BATCH_SIZE > 0).
+def _use_batched(duration: Optional[float]) -> bool:
+    """Whether this request should use BatchedInferencePipeline.
 
-    Batched mode chunks the ~30 s windows itself and does not support
+    ``WHISPER_BATCH_SIZE > 0`` enables batching; ``WHISPER_BATCH_MIN_SECONDS``
+    (``> 0``) restricts it to clips at least that long. Unknown duration falls
+    back to the sequential path (docs/PLAN-performance.md Phase 2).
+    """
+    if settings.batch_size <= 0:
+        return False
+    if settings.batch_min_seconds <= 0:
+        return True
+    return duration is not None and duration >= settings.batch_min_seconds
+
+
+def _build_runner(wm: Any, duration: Optional[float] = None) -> Any:
+    """Model or opt-in BatchedInferencePipeline wrapper.
+
+    Selected when ``WHISPER_BATCH_SIZE > 0`` and, if
+    ``WHISPER_BATCH_MIN_SECONDS > 0``, the clip is at least that long. Batched
+    mode chunks the ~30 s windows itself and does not support
     condition_on_previous_text, so it can change segmentation/casing — strict
     opt-in (docs/PLAN-performance.md Phase 2). Either form exposes .transcribe,
     so the collection/streaming units are runner-agnostic.
     """
-    if settings.batch_size > 0:
+    if _use_batched(duration):
         from faster_whisper import BatchedInferencePipeline
 
         return BatchedInferencePipeline(model=wm)
     return wm
 
 
-def _transcribe_collect(runner: Any, path: str, kwargs: dict) -> tuple:
+def _transcribe_collect(
+    runner: Any,
+    audio: Any,
+    kwargs: dict,
+    collect_segments: bool = True,
+) -> tuple:
     """Blocking unit: transcribe + aggregate segments/text (worker thread).
 
     Serialized on the shared model — ``runner.transcribe`` is lazy, so the
     lock covers the segment iteration too (that is where the decode runs).
+    With ``collect_segments=False`` (text output / timestamps=false) segment
+    dicts and token lists are never built.
     """
     with _inference_lock:
-        segments, info = runner.transcribe(path, **kwargs)
-        segment_list = [_segment_dict(seg) for seg in segments]
-    full_text = "".join(seg["text"] for seg in segment_list).strip()
+        _seek_start(audio)
+        segments, info = runner.transcribe(audio, **kwargs)
+        if collect_segments:
+            segment_list = [_segment_dict(seg) for seg in segments]
+            parts = [seg["text"] for seg in segment_list]
+        else:
+            segment_list = []
+            parts = [seg.text for seg in segments]
+    full_text = "".join(parts).strip()
     return segment_list, info, full_text
 
 
@@ -837,14 +923,15 @@ def _transcribe_collect(runner: Any, path: str, kwargs: dict) -> tuple:
 # real client before promising strict parity.
 
 
-def _stream_worker(runner: Any, path: str, kwargs: dict, q: "queue.SimpleQueue") -> None:
+def _stream_worker(runner: Any, audio: Any, kwargs: dict, q: "queue.SimpleQueue") -> None:
     """Producer: ('segment', dict) / ('done', (info, text)) / ('error', msg) / ('end', None).
 
     Serialized like ``_transcribe_collect`` (shared model, lazy decode).
     """
     try:
         with _inference_lock:
-            segments, info = runner.transcribe(path, **kwargs)
+            _seek_start(audio)
+            segments, info = runner.transcribe(audio, **kwargs)
             parts = []
             for seg in segments:
                 d = _segment_dict(seg)
@@ -857,11 +944,11 @@ def _stream_worker(runner: Any, path: str, kwargs: dict, q: "queue.SimpleQueue")
         q.put(("end", None))
 
 
-async def _sse_stream(runner: Any, path: str, kwargs: dict, task: str):
+async def _sse_stream(runner: Any, audio: Any, kwargs: dict, task: str, upload: UploadFile):
     """SSE generator: per-segment deltas, then transcript.done + [DONE]."""
     q: "queue.SimpleQueue" = queue.SimpleQueue()
     loop = asyncio.get_running_loop()
-    fut = loop.run_in_executor(_inference_pool(), _stream_worker, runner, path, kwargs, q)
+    fut = loop.run_in_executor(_inference_pool(), _stream_worker, runner, audio, kwargs, q)
     try:
         while True:
             kind, payload = await run_in_threadpool(q.get)
@@ -886,13 +973,13 @@ async def _sse_stream(runner: Any, path: str, kwargs: dict, task: str):
                 break
     finally:
         # Drain the producer before closing so the pool slot is freed, then
-        # release the temp file the route relinquished to us for streaming.
+        # release the buffered upload the route relinquished to us.
         if not fut.done():
             await fut
         try:
-            os.unlink(path)
-        except OSError:
-            logger.debug("temp file already gone on stream drain: %s", path)
+            await upload.close()
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("upload already closed on stream drain", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -944,6 +1031,7 @@ async def health():
         "temperature_schedule": settings.temperature_schedule or None,
         "cpu_threads": settings.cpu_threads,
         "batch_size": settings.batch_size,
+        "batch_min_seconds": settings.batch_min_seconds,
         "vad_filter": settings.vad_filter,
         "hf_offline": settings.hf_offline,
         "latency_ms": _stage_stats(),
@@ -980,21 +1068,20 @@ async def transcribe_audio(
     store.touch()
     wm = await _offload(store.get)
 
-    tmp_path: Optional[str] = None
+    stream_owned = False
     try:
-        # 1. Stream the upload to disk (bounded RAM; 413 mid-stream past cap)
-        #    under a sanitized extension that mirrors the real upload. PyAV
-        #    sniffs the bytes, so the extension is hygiene, not logic.
-        suffix = _safe_suffix(file.filename)
+        # 1. Validate the upload. Starlette has already parsed the multipart
+        #    body into file.file (a SpooledTemporaryFile), so the route hands
+        #    that to PyAV/faster-whisper directly instead of copying it again.
         _t_up = time.perf_counter()
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            await _write_upload(file, tmp, limit)
-            tmp_path = tmp.name
+        _reject_too_large(file.size or 0, limit)
         _record_stage("upload", time.perf_counter() - _t_up)
 
-        # 2. Reject audio longer than the cap before touching the model.
+        # 2. Probe the duration: enforce the cap and, when adaptive batching is
+        #    configured, pick the runner. Both use one PyAV metadata read.
         _t_dur = time.perf_counter()
-        await _guard_duration_ok(tmp_path)
+        needs_duration = settings.batch_size > 0 and settings.batch_min_seconds > 0
+        duration = await _guard_duration_ok(file.file, probe=needs_duration)
         _record_stage("duration", time.perf_counter() - _t_dur)
 
         # 3. Build transcription kwargs. Client `language` wins; otherwise
@@ -1002,29 +1089,38 @@ async def transcribe_audio(
         #    a server-wide initial prompt applies. faster-whisper names the
         #    prompt kwarg `initial_prompt` (OpenAI calls it `prompt`).
         _t_lang = time.perf_counter()
-        resolved_language = await _offload(_resolve_language, wm, tmp_path, language)
+        resolved_language = await _offload(
+            _resolve_language, wm, file.file, language
+        )
         _record_stage("language", time.perf_counter() - _t_lang)
         resolved_prompt = prompt or settings.initial_prompt
-        runner = _build_runner(wm)
+        # Text-only requests skip timestamp-token prediction and segment dicts.
+        needs_segments = fmt in ("srt", "vtt") or (fmt == "json" and bool(timestamps))
+        without_timestamps = not needs_segments and not stream
+        batched = _use_batched(duration)
+        runner = _build_runner(wm, duration)
         kwargs = _build_kwargs(
             language=resolved_language,
             prompt=resolved_prompt,
             temperature=temperature if temperature is not None else 0.0,
-            batched=settings.batch_size > 0,
+            batched=batched,
+            without_timestamps=without_timestamps,
         )
 
         # 4. Optional OpenAI-style streaming (SSE); otherwise run inference
         #    off the event loop with the configured abandon-timeout.
         if stream:
-            return StreamingResponse(
-                _sse_stream(runner, tmp_path, kwargs, task="transcribe"),
+            response = StreamingResponse(
+                _sse_stream(runner, file.file, kwargs, task="transcribe", upload=file),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache"},
             )
+            stream_owned = True
+            return response
 
         _t_inf = time.perf_counter()
         segment_list, info, full_text = await _maybe_timeout(
-            _offload(_transcribe_collect, runner, tmp_path, kwargs),
+            _offload(_transcribe_collect, runner, file.file, kwargs, needs_segments),
             settings.request_timeout_s,
         )
         _record_stage("inference", time.perf_counter() - _t_inf)
@@ -1049,13 +1145,13 @@ async def transcribe_audio(
         # Rolling p50/p95 stage timings; stream paths record setup stages only
         # (inference finishes after the streaming response returns).
         _record_stage("total", time.perf_counter() - _t_route)
-        # For stream=true the temp file is owned by _sse_stream (which unlinks it
-        # after draining); here we only clean up the non-streaming path.
-        if tmp_path and not stream:
+        # For stream=true _sse_stream owns the upload and closes it after
+        # draining; otherwise close it here (FastAPI also auto-closes).
+        if not stream_owned:
             try:
-                os.unlink(tmp_path)
-            except OSError:
-                logger.debug("temp file already gone (transcribe): %s", tmp_path)
+                await file.close()
+            except Exception:  # pragma: no cover - defensive
+                logger.debug("upload close failed (transcribe)", exc_info=True)
 
 
 @app.post("/v1/audio/translations")
@@ -1084,44 +1180,50 @@ async def translate_audio(
     store.touch()
     wm = await _offload(store.get)
 
-    tmp_path: Optional[str] = None
+    stream_owned = False
     try:
         _t_up = time.perf_counter()
-        suffix = _safe_suffix(file.filename)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            await _write_upload(file, tmp, limit)
-            tmp_path = tmp.name
+        _reject_too_large(file.size or 0, limit)
         _record_stage("upload", time.perf_counter() - _t_up)
 
         _t_dur = time.perf_counter()
-        await _guard_duration_ok(tmp_path)
+        needs_duration = settings.batch_size > 0 and settings.batch_min_seconds > 0
+        duration = await _guard_duration_ok(file.file, probe=needs_duration)
         _record_stage("duration", time.perf_counter() - _t_dur)
 
         # Server defaults/allowlist steer source-language detection
         # (OpenAI's translations endpoint always translates *to* English).
         _t_lang = time.perf_counter()
-        resolved_language = await _offload(_resolve_language, wm, tmp_path, None)
+        resolved_language = await _offload(
+            _resolve_language, wm, file.file, None
+        )
         _record_stage("language", time.perf_counter() - _t_lang)
         resolved_prompt = prompt or settings.initial_prompt
-        runner = _build_runner(wm)
+        needs_segments = fmt in ("srt", "vtt") or (fmt == "json" and bool(timestamps))
+        without_timestamps = not needs_segments and not stream
+        batched = _use_batched(duration)
+        runner = _build_runner(wm, duration)
         kwargs = _build_kwargs(
             language=resolved_language,
             prompt=resolved_prompt,
             temperature=temperature if temperature is not None else 0.0,
             task="translate",
-            batched=settings.batch_size > 0,
+            batched=batched,
+            without_timestamps=without_timestamps,
         )
 
         if stream:
-            return StreamingResponse(
-                _sse_stream(runner, tmp_path, kwargs, task="translate"),
+            response = StreamingResponse(
+                _sse_stream(runner, file.file, kwargs, task="translate", upload=file),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache"},
             )
+            stream_owned = True
+            return response
 
         _t_inf = time.perf_counter()
         segment_list, info, full_text = await _maybe_timeout(
-            _offload(_transcribe_collect, runner, tmp_path, kwargs),
+            _offload(_transcribe_collect, runner, file.file, kwargs, needs_segments),
             settings.request_timeout_s,
         )
         _record_stage("inference", time.perf_counter() - _t_inf)
@@ -1144,12 +1246,12 @@ async def translate_audio(
     finally:
         # Rolling p50/p95 stage timings; stream paths record setup stages only.
         _record_stage("total", time.perf_counter() - _t_route)
-        # stream=true -> _sse_stream owns cleanup of the temp file.
-        if tmp_path and not stream:
+        # stream=true -> _sse_stream owns (and closes) the buffered upload.
+        if not stream_owned:
             try:
-                os.unlink(tmp_path)
-            except OSError:
-                logger.debug("temp file already gone (translate): %s", tmp_path)
+                await file.close()
+            except Exception:  # pragma: no cover - defensive
+                logger.debug("upload close failed (translate)", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
