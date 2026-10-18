@@ -1,0 +1,29 @@
+# Dependabot: keep GitHub Actions and Python dependencies up to date.
+# See https://docs.github.com/code-security/dependabot/dependabot-version-updates
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    # `@vN` action refs (immutable commit-SHA pinning is a separate hardening
+    # step) — Dependabot opens PRs for new majors/minors automatically.
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "ci"
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "pip"
+    directory: "/"
+    # Tracked against pyproject.toml + uv.lock (uv-managed, CPU-only
+    # faster-whisper/CTranslate2 stack). Dependabot will propose dependency
+    # updates; the Docker image syncs with `uv sync --locked`, so a bumped
+    # lockfile must keep that build valid.
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "python"
+    cooldown:
+      default-days: 7
