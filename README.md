@@ -823,7 +823,7 @@ put it behind your monitoring proxy.
 
 ```dockerfile
 FROM python:3.14-slim AS builder
-COPY --from=ghcr.io/astral-sh/uv:0.12.13 /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.13.1 /uv /uvx /bin/
 ENV UV_PYTHON_DOWNLOADS=0 \
     UV_LINK_MODE=copy \
     UV_COMPILE_BYTECODE=1
@@ -836,7 +836,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 Details that matter:
 
-- **uv 0.12.13** is copied from the official image, pinned to the version that
+- **uv 0.13.1** is copied from the official image, pinned to the version that
   generated `uv.lock`. Updating dependencies requires regenerating the lock and
   keeping the Docker pin compatible, otherwise `--locked` builds fail.
 - **`UV_PYTHON_DOWNLOADS=0`** forces use of the system Python 3.14 in the slim

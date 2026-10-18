@@ -14,6 +14,7 @@ uv run python app.py          # dev server on :8080
 uv run python -c "import app" # import smoke check (does not load the model)
 ```
 
+- Local dev and CI use `.python-version` (3.14), matching the Docker image (`python:3.14-slim`).
 - The app is not installed into the venv, so imports only work when the repo root is on `sys.path`.
 - Docker: `docker compose up -d --build`, or `docker build -f deploy/Dockerfile -t whisper-api .`. The first startup downloads weights into `/data/hf`.
 
@@ -46,5 +47,5 @@ uv run python -m pytest tests/test_tuning.py::test_route_forwards_beam_and_sched
 ## Docker and CI
 
 - The runtime image copies **only `app.py`** and runs `uv sync --locked --no-install-project`. If you add runtime modules or data files, update `deploy/Dockerfile` or the image will fail at startup.
-- Docker pins uv `0.12.13` and Python `3.14`; a newer local uv may be in use. If dependencies change, regenerate `uv.lock` intentionally (`uv lock` / `uv lock --upgrade`) and keep the Dockerfile's uv pin compatible, otherwise `--locked` builds can fail. `.dockerignore` excludes tests and the local `.venv`.
+- Docker pins uv `0.13.1` and Python `3.14`; a different local uv may be in use. If dependencies change, regenerate `uv.lock` intentionally (`uv lock` / `uv lock --upgrade`) and keep the Dockerfile's uv pin compatible, otherwise `--locked` builds can fail. `.dockerignore` excludes tests and the local `.venv`.
 - `.github/workflows/docker-publish.yml` runs only an import/OpenAPI smoke test, then publishes to GHCR on pushes to `main` and `v*.*.*` tags. There is no test job and no PR trigger, so run the unit/e2e suites locally before pushing.

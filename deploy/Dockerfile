@@ -7,7 +7,7 @@
 #   https://docs.astral.sh/uv/guides/integration/docker/
 #
 # The builder runs on python:3.14-slim (system Python 3.14) and copies the uv
-# binary from ghcr.io/astral-sh/uv:0.12.13 — pinned to the exact uv version that
+# binary from ghcr.io/astral-sh/uv:0.13.1 — pinned to the exact uv version that
 # generated uv.lock. Using the system interpreter with UV_PYTHON_DOWNLOADS=0
 # keeps the venv's Python path identical across both stages (the same image
 # name, python:3.14-slim, in builder and runtime) so copying .venv over is safe.
@@ -30,7 +30,7 @@
 FROM python:3.14-slim AS builder
 
 # Pin uv to the exact version used to (re)generate uv.lock.
-COPY --from=ghcr.io/astral-sh/uv:0.12.13 /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.13.1 /uv /uvx /bin/
 
 # Use the system Python already present in the slim image (3.14).
 ENV UV_PYTHON_DOWNLOADS=0 \

@@ -33,7 +33,7 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v7
         with:
-          version: "0.12.13"
+          version: "0.13.1"
           enable-cache: true
 
       - name: Sync environment from lockfile
