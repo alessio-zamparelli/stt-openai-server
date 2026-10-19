@@ -11,8 +11,13 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-import app as app_module
-from app import ModelStore, Settings, _build_kwargs, _parse_temperatures
+import stt_api.runtime as runtime
+import stt_api.services.inference as inference
+import stt_api.services.model_store as model_store
+from stt_api.config import Settings
+from stt_api.main import app as fastapi_app
+from stt_api.services.inference import _build_kwargs, _parse_temperatures
+from stt_api.services.model_store import ModelStore
 
 
 def _make_wav(seconds: float = 0.5, rate: int = 16000) -> bytes:
@@ -42,13 +47,13 @@ class FakeModel:
 @contextmanager
 def _client(cfg: Settings, model: FakeModel):
     store = ModelStore(config=cfg, loader=lambda: model)
-    orig_store, orig_cfg = app_module.store, app_module.settings
-    app_module.store, app_module.settings = store, cfg
+    orig_store, orig_cfg = runtime.store, runtime.settings
+    runtime.store, runtime.settings = store, cfg
     try:
-        with TestClient(app_module.app) as client:
+        with TestClient(fastapi_app) as client:
             yield client, model
     finally:
-        app_module.store, app_module.settings = orig_store, orig_cfg
+        runtime.store, runtime.settings = orig_store, orig_cfg
 
 
 # -- temperature schedule parsing -----------------------------------------
@@ -68,14 +73,14 @@ def test_parse_temperatures():
 
 
 def test_build_kwargs_forwards_beam_and_best_of(monkeypatch):
-    monkeypatch.setattr(app_module, "settings", Settings(beam_size=2, best_of=2))
+    monkeypatch.setattr(runtime, "settings", Settings(beam_size=2, best_of=2))
     kw = _build_kwargs(language=None, prompt=None, temperature=0.0)
     assert kw["beam_size"] == 2
     assert kw["best_of"] == 2
 
 
 def test_build_kwargs_defaults_beam_and_best_of(monkeypatch):
-    monkeypatch.setattr(app_module, "settings", Settings())
+    monkeypatch.setattr(runtime, "settings", Settings())
     kw = _build_kwargs(language=None, prompt=None, temperature=0.0)
     assert kw["beam_size"] == 5
     assert kw["best_of"] == 5
@@ -83,14 +88,14 @@ def test_build_kwargs_defaults_beam_and_best_of(monkeypatch):
 
 def test_build_kwargs_schedule_overrides_scalar(monkeypatch):
     monkeypatch.setattr(
-        app_module, "settings", Settings(temperature_schedule="0,0.2,0.4")
+        runtime, "settings", Settings(temperature_schedule="0,0.2,0.4")
     )
     kw = _build_kwargs(language=None, prompt=None, temperature=0.0)
     assert kw["temperature"] == [0.0, 0.2, 0.4]
 
 
 def test_build_kwargs_bad_schedule_falls_back_to_scalar(monkeypatch):
-    monkeypatch.setattr(app_module, "settings", Settings(temperature_schedule="oops"))
+    monkeypatch.setattr(runtime, "settings", Settings(temperature_schedule="oops"))
     kw = _build_kwargs(language=None, prompt=None, temperature=0.7)
     assert kw["temperature"] == 0.7
 
@@ -115,8 +120,8 @@ def test_load_model_passes_cpu_threads(monkeypatch):
             captured.update(kwargs)
 
     monkeypatch.setattr("faster_whisper.WhisperModel", FakeWhisperModel)
-    monkeypatch.setattr(app_module, "settings", Settings(cpu_threads=2))
-    app_module._load_model()
+    monkeypatch.setattr(runtime, "settings", Settings(cpu_threads=2))
+    model_store._load_model()
     assert captured["cpu_threads"] == 2
 
 
@@ -128,8 +133,8 @@ def test_load_model_passes_zero_cpu_threads(monkeypatch):
             captured.update(kwargs)
 
     monkeypatch.setattr("faster_whisper.WhisperModel", FakeWhisperModel)
-    monkeypatch.setattr(app_module, "settings", Settings(cpu_threads=0))
-    app_module._load_model()
+    monkeypatch.setattr(runtime, "settings", Settings(cpu_threads=0))
+    model_store._load_model()
     assert captured["cpu_threads"] == 0  # fw default
 
 
@@ -189,22 +194,22 @@ class _FakeBP:
 
 
 def test_build_runner_returns_model_when_batch_zero(monkeypatch):
-    monkeypatch.setattr(app_module, "settings", Settings(batch_size=0))
+    monkeypatch.setattr(runtime, "settings", Settings(batch_size=0))
     model = FakeModel()
-    assert app_module._build_runner(model) is model
+    assert inference._build_runner(model) is model
 
 
 def test_build_runner_wraps_when_batch_set(monkeypatch):
-    monkeypatch.setattr(app_module, "settings", Settings(batch_size=4))
+    monkeypatch.setattr(runtime, "settings", Settings(batch_size=4))
     monkeypatch.setattr("faster_whisper.BatchedInferencePipeline", _FakeBP)
     model = FakeModel()
-    wrapped = app_module._build_runner(model)
+    wrapped = inference._build_runner(model)
     assert isinstance(wrapped, _FakeBP)
     assert wrapped.model is model
 
 
 def test_build_kwargs_batched_adds_batch_size(monkeypatch):
-    monkeypatch.setattr(app_module, "settings", Settings(batch_size=4))
+    monkeypatch.setattr(runtime, "settings", Settings(batch_size=4))
     kw = _build_kwargs(language=None, prompt=None, temperature=0.0, batched=True)
     assert kw["batch_size"] == 4
     kw_off = _build_kwargs(language=None, prompt=None, temperature=0.0, batched=False)
@@ -213,10 +218,10 @@ def test_build_kwargs_batched_adds_batch_size(monkeypatch):
 
 def test_build_kwargs_batched_forces_vad_filter(monkeypatch):
     """BatchedInferencePipeline needs VAD (or clip_timestamps) to chunk audio;
-    WHISPER_VAD only governs the sequential path."""
+    STT_VAD only governs the sequential path."""
     for vad in (False, True):
         monkeypatch.setattr(
-            app_module, "settings", Settings(batch_size=4, vad_filter=vad)
+            runtime, "settings", Settings(batch_size=4, vad_filter=vad)
         )
         kw = _build_kwargs(
             language=None, prompt=None, temperature=0.0, batched=True
@@ -228,20 +233,20 @@ def test_build_runner_respects_batch_min_seconds(monkeypatch):
     monkeypatch.setattr("faster_whisper.BatchedInferencePipeline", _FakeBP)
     model = FakeModel()
     monkeypatch.setattr(
-        app_module, "settings", Settings(batch_size=4, batch_min_seconds=30)
+        runtime, "settings", Settings(batch_size=4, batch_min_seconds=30)
     )
-    assert app_module._build_runner(model, duration=None) is model
-    assert app_module._build_runner(model, duration=10.0) is model
-    assert isinstance(app_module._build_runner(model, duration=30.0), _FakeBP)
+    assert inference._build_runner(model, duration=None) is model
+    assert inference._build_runner(model, duration=10.0) is model
+    assert isinstance(inference._build_runner(model, duration=30.0), _FakeBP)
     # batch_min_seconds=0 keeps the old "always batch" behaviour.
     monkeypatch.setattr(
-        app_module, "settings", Settings(batch_size=4, batch_min_seconds=0)
+        runtime, "settings", Settings(batch_size=4, batch_min_seconds=0)
     )
-    assert isinstance(app_module._build_runner(model, duration=10.0), _FakeBP)
+    assert isinstance(inference._build_runner(model, duration=10.0), _FakeBP)
 
 
 def test_route_uses_batched_runner(monkeypatch):
-    monkeypatch.setattr(app_module, "settings", Settings(batch_size=4))
+    monkeypatch.setattr(runtime, "settings", Settings(batch_size=4))
     monkeypatch.setattr("faster_whisper.BatchedInferencePipeline", _FakeBP)
     model = FakeModel()
     with _client(Settings(batch_size=4), model) as (client, _):
@@ -257,7 +262,7 @@ def test_route_uses_batched_runner(monkeypatch):
 
 
 def test_route_adapts_batching_to_duration(monkeypatch):
-    """WHISPER_BATCH_MIN_SECONDS: long clips batch, short clips stay sequential."""
+    """STT_BATCH_MIN_SECONDS: long clips batch, short clips stay sequential."""
     monkeypatch.setattr("faster_whisper.BatchedInferencePipeline", _FakeBP)
     model = FakeModel()
     cfg = Settings(batch_size=4, batch_min_seconds=1)
@@ -278,7 +283,7 @@ def test_route_adapts_batching_to_duration(monkeypatch):
 
 
 def test_translate_route_uses_batched_runner(monkeypatch):
-    monkeypatch.setattr(app_module, "settings", Settings(batch_size=4))
+    monkeypatch.setattr(runtime, "settings", Settings(batch_size=4))
     monkeypatch.setattr("faster_whisper.BatchedInferencePipeline", _FakeBP)
     model = FakeModel()
     with _client(Settings(batch_size=4), model) as (client, _):

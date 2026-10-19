@@ -1,7 +1,7 @@
 [project]
-name = "whisper-api"
-version = "0.1.0"
-description = "OpenAI-compatible Whisper API server backed by faster-whisper"
+name = "stt-api"
+version = "0.2.0"
+description = "OpenAI-compatible STT API server backed by faster-whisper"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -11,10 +11,14 @@ dependencies = [
     "uvicorn[standard]>=0.23.0",
     "pydantic>=2.0.0",
     "python-multipart>=0.0.9",
+    "wyoming>=1.8.0",
+    "zeroconf>=0.132.0",
 ]
 
 [project.scripts]
-whisper-api = "app:main"
+stt-api = "stt_api.main:main"
+# One-release migration aid for existing scripts; remove in the next minor.
+whisper-api = "stt_api.main:main"
 
 [dependency-groups]
 dev = [
@@ -31,8 +35,15 @@ testpaths = ["tests"]
 addopts = "-q"
 
 [tool.uv]
-# Single-module app (app.py) — not installable as a wheel; sync deps only.
-package = false
+# Installable package (stt_api → stt_api). Docker still uses
+# --no-install-project and copies the source tree.
+package = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["stt_api"]
+
+[tool.fastapi]
+entrypoint = "stt_api.main:app"
 
 [[tool.uv.index]]
 name = "pypi"

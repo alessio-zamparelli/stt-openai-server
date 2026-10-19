@@ -47,10 +47,10 @@ def server(tmp_path_factory):
     log_path = tmp_path_factory.mktemp("server") / "server.log"
     env = os.environ.copy()
     env.update(
-        WHISPER_HOST="127.0.0.1",
-        WHISPER_PORT=str(port),
-        WHISPER_MODEL_NAME="base",
-        WHISPER_COMPUTE_TYPE="int8",
+        STT_HOST="127.0.0.1",
+        STT_PORT=str(port),
+        STT_MODEL_NAME="base",
+        STT_COMPUTE_TYPE="int8",
         PYTHONUNBUFFERED="1",
     )
     with open(log_path, "wb") as log:

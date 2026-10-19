@@ -2,13 +2,13 @@
 End-to-end tests for the server-side language features on the REAL model.
 
 Boots real faster-whisper servers as subprocesses (real inference — no mocks)
-with the WHISPER_* language knobs set, then exercises the resolution logic
+with the STT_* language knobs set, then exercises the resolution logic
 over HTTP:
 
-  - WHISPER_LANGUAGE       server default language applied when the client omits it
-  - WHISPER_LANGUAGES      allowlist; with several codes, audio-language
+  - STT_LANGUAGE       server default language applied when the client omits it
+  - STT_LANGUAGES      allowlist; with several codes, audio-language
                            detection is *constrained* to the allowed set
-  - WHISPER_INITIAL_PROMPT server-wide prompt fallback (client may override)
+  - STT_INITIAL_PROMPT server-wide prompt fallback (client may override)
 
 Run:  uv run pytest tests/e2e_language_test.py -v
 
@@ -35,11 +35,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SAMPLE_URL = "https://github.com/openai/whisper/raw/main/tests/jfk.flac"
 EXPECTED_PHRASE = "my fellow americans"
 STARTUP_TIMEOUT_S = 180  # model download/load can be slow on first run
-SAMPLE_CACHE = Path(tempfile.gettempdir()) / "whisper_api_test_jfk.flac"
+SAMPLE_CACHE = Path(tempfile.gettempdir()) / "stt_api_test_jfk.flac"
 
 
 # ---------------------------------------------------------------------------
-# Server booting (real app.py subprocess, WHISPER_* env)
+# Server booting (real app.py subprocess, STT_* env)
 # ---------------------------------------------------------------------------
 
 def _free_port() -> int:
@@ -50,16 +50,16 @@ def _free_port() -> int:
 
 @contextlib.contextmanager
 def _server(tmp_path_factory, extra_env: dict):
-    """Boot app.py with the given WHISPER_* env; kill it on exit."""
+    """Boot app.py with the given STT_* env; kill it on exit."""
     port = _free_port()
     log_path = tmp_path_factory.mktemp("server") / "server.log"
     env = os.environ.copy()
     env.update(
-        WHISPER_HOST="127.0.0.1",
-        WHISPER_PORT=str(port),
-        WHISPER_MODEL_NAME="base",
-        WHISPER_COMPUTE_TYPE="int8",
-        WHISPER_IDLE_UNLOAD_S="0",  # keep the model hot for deterministic timing
+        STT_HOST="127.0.0.1",
+        STT_PORT=str(port),
+        STT_MODEL_NAME="base",
+        STT_COMPUTE_TYPE="int8",
+        STT_IDLE_UNLOAD_S="0",  # keep the model hot for deterministic timing
         PYTHONUNBUFFERED="1",
         **extra_env,
     )
@@ -104,18 +104,18 @@ def _server(tmp_path_factory, extra_env: dict):
 
 @pytest.fixture(scope="session")
 def server_default_lang(tmp_path_factory):
-    """WHISPER_LANGUAGE=it (server default) + a server-wide initial prompt."""
+    """STT_LANGUAGE=it (server default) + a server-wide initial prompt."""
     with _server(
         tmp_path_factory,
-        {"WHISPER_LANGUAGE": "it", "WHISPER_INITIAL_PROMPT": "Transcribe the audio."},
+        {"STT_LANGUAGE": "it", "STT_INITIAL_PROMPT": "Transcribe the audio."},
     ) as url:
         yield url
 
 
 @pytest.fixture(scope="session")
 def server_allowlist(tmp_path_factory):
-    """WHISPER_LANGUAGES=it,en: constrained detection, no forced default."""
-    with _server(tmp_path_factory, {"WHISPER_LANGUAGES": "it,en"}) as url:
+    """STT_LANGUAGES=it,en: constrained detection, no forced default."""
+    with _server(tmp_path_factory, {"STT_LANGUAGES": "it,en"}) as url:
         yield url
 
 
@@ -145,7 +145,7 @@ def speech_sample():
             )
         return SAMPLE_CACHE, True
     except httpx.HTTPError:
-        tone = Path(tempfile.gettempdir()) / "whisper_api_test_tone.wav"
+        tone = Path(tempfile.gettempdir()) / "stt_api_test_tone.wav"
         with wave.open(str(tone), "wb") as w:
             w.setnchannels(1)
             w.setsampwidth(2)
@@ -168,7 +168,7 @@ def _transcribe(client, sample_path, **data):
 
 
 # ---------------------------------------------------------------------------
-# Server A: WHISPER_LANGUAGE=it  (server default)
+# Server A: STT_LANGUAGE=it  (server default)
 # ---------------------------------------------------------------------------
 
 def test_health_reports_default_language(client_default_lang):
@@ -239,7 +239,7 @@ def test_client_prompt_overrides_server_prompt(client_default_lang, speech_sampl
 
 
 # ---------------------------------------------------------------------------
-# Server B: WHISPER_LANGUAGES=it,en  (constrained detection)
+# Server B: STT_LANGUAGES=it,en  (constrained detection)
 # ---------------------------------------------------------------------------
 
 def test_health_reports_allowlist(client_allowlist):

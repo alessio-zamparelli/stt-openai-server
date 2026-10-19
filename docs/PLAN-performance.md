@@ -1,5 +1,9 @@
 # PLAN — Performance: tuning, batched inference, CPU budget, observability
 
+> **Layout note (post-refactor):** implementation moved from `app.py` to
+> `stt_api/` (`services/inference.py`, `services/language.py`, `runtime.py`,
+> `routers/`). Env vars are now `STT_*`; `WHISPER_*` remains a deprecated alias.
+
 > **Goal:** cut per-request latency on the CPU-only deployment *without*
 > degrading transcription accuracy and without changing the API contract.
 > The floor today is CTranslate2 inference on whisper's fixed ~30 s windows;
@@ -57,7 +61,7 @@ Reading of the numbers:
 
 > Review finding, added to this plan before any tuning work: an unsynchronized
 > lazy singleton is a latent thread-safety defect that would silently break the
-> `WHISPER_MAX_CONCURRENT` bound this whole plan builds on — fix it first.
+> `STT_MAX_CONCURRENT` bound this whole plan builds on — fix it first.
 
 ### Finding
 
@@ -123,10 +127,10 @@ new `max_concurrent` instead of inheriting a stale snapshot.
 
 ## Phase 1 (P0) — inference knobs, env-exposed, defaults gated on accuracy
 
-### A. `WHISPER_BEAM_SIZE` / `WHISPER_BEST_OF`
+### A. `STT_BEAM_SIZE` / `STT_BEST_OF`
 
 - `Settings` gains `beam_size: int = 5`, `best_of: int = 5` (env
-  `WHISPER_BEAM_SIZE` / `WHISPER_BEST_OF`), plumbed through `_build_kwargs`.
+  `STT_BEAM_SIZE` / `STT_BEST_OF`), plumbed through `_build_kwargs`.
 - Default stays 5 (accuracy-first). The README gets a "latency tuning" table
   recommending `2/2` for TTS-pipeline-style short clips.
 - Accuracy gate **before** touching the default (measured later, 10-clip
@@ -136,7 +140,7 @@ new `max_concurrent` instead of inheriting a stale snapshot.
   run-dependent and measurably worse on short phrases → default stays
   `beam=5`; the knob ships opt-in + the README accuracy table.
 
-### B. `WHISPER_TEMPERATURES` (trimmed fallback schedule)
+### B. `STT_TEMPERATURES` (trimmed fallback schedule)
 
 - `Settings.temperature_schedule: str = ""` — empty = faster-whisper default;
   parse comma-separated floats (e.g. `0,0.2,0.4`) into the list faster-whisper
@@ -150,7 +154,7 @@ new `max_concurrent` instead of inheriting a stale snapshot.
 - Risk: fewer retries on genuinely garbled audio → slightly worse worst-case.
   Documented as a latency/robustness tradeoff knob, default unchanged.
 
-### C. `WHISPER_CPU_THREADS` (right-size the pool)
+### C. `STT_CPU_THREADS` (right-size the pool)
 
 - `WhisperModel(..., cpu_threads=N)`; knob default `0` = faster-whisper's own
   default (≈4 here). Since inference is serialized on the one shared model
@@ -163,15 +167,15 @@ new `max_concurrent` instead of inheriting a stale snapshot.
   Measured caveat: on short-clip bursts (accuracy corpus, 10 tiny clips) it
   *added* ~8% wall time — intra-op threading pays off on long single clips,
   not many tiny ones.
-- Interplay with `WHISPER_MAX_CONCURRENT` is now *serialized*: only one decode
+- Interplay with `STT_MAX_CONCURRENT` is now *serialized*: only one decode
   runs at a time, so `MAX_CONCURRENT` bounds the **queue**, not overlapping
   decodes. `cpu_threads × cores` no longer compounds across workers.
 
 ### Phase-1 tests
 
-- unit: `_build_kwargs` forwards the three new knobs; bad `WHISPER_TEMPERATURES`
+- unit: `_build_kwargs` forwards the three new knobs; bad `STT_TEMPERATURES`
   value falls back to default (no 500).
-- e2e (real server): boot with `WHISPER_BEAM_SIZE=2 WHISPER_BEST_OF=2` — jfk
+- e2e (real server): boot with `STT_BEAM_SIZE=2 STT_BEST_OF=2` — jfk
   still returns the phrase (no repetition loops) and `/health` reports the
   effective knobs.
 
@@ -179,7 +183,7 @@ new `max_concurrent` instead of inheriting a stale snapshot.
 
 ## Phase 2 (P1) — batched inference for long clips (opt-in)
 
-- `Settings.batch_size: int = 0` (`WHISPER_BATCH_SIZE`; 0 = off).
+- `Settings.batch_size: int = 0` (`STT_BATCH_SIZE`; 0 = off).
 - When `> 0`, build the inference unit on
   `BatchedInferencePipeline(model=wm)` and call
   `bp.transcribe(path, batch_size=..., beam_size=..., ...)`; the SSE producer
@@ -195,14 +199,14 @@ new `max_concurrent` instead of inheriting a stale snapshot.
 - Reset-per-request: constructing `BatchedInferencePipeline` per request is
   cheap (wraps the model); cache one per store alongside `wm` if profiling
   shows otherwise.
-- Interplay with `WHISPER_MAX_CONCURRENT`: batch size N × threads T is the
+- Interplay with `STT_MAX_CONCURRENT`: batch size N × threads T is the
   real concurrency footprint — document a worked example
   (`cpu_threads=2, batch=4, max_concurrent=2` on 4 cores).
 
 ### Phase-2 tests
 
 - unit: fake-model path still receives the right kwargs when `batch_size>0`.
-- e2e (real server): `WHISPER_BATCH_SIZE=4` on the 88 s concatenated clip —
+- e2e (real server): `STT_BATCH_SIZE=4` on the 88 s concatenated clip —
   200 with non-empty text, wall-time materially lower than the sequential
   e2e baseline (assert `< 0.75 ×` the measured sequential time to stay
   variance-safe), SSE events still stream progressively.
@@ -211,7 +215,7 @@ new `max_concurrent` instead of inheriting a stale snapshot.
 
 ## Phase 3 (P2) — VAD, offline reload, observability, ops runbook
 
-### D. `WHISPER_VAD` (opt-in Silero VAD pre-pass)
+### D. `STT_VAD` (opt-in Silero VAD pre-pass)
 
 - `Settings.vad: bool = False` → `vad_filter=True` in `_build_kwargs`.
 - Only worth it for inputs with leading/trailing silence or long pauses;
@@ -241,10 +245,10 @@ new `max_concurrent` instead of inheriting a stale snapshot.
 - **One resident model per host** (or CPU-quota the containers): the measured
   3–4 s floor under 4-model contention is an ops problem, not a code bug —
   say so explicitly with the numbers.
-- Worked sizing example: 4 cores → `WHISPER_MAX_CONCURRENT=2`,
-  `WHISPER_CPU_THREADS=2`, `WHISPER_BATCH_SIZE=0` (or `=4` with
+- Worked sizing example: 4 cores → `STT_MAX_CONCURRENT=2`,
+  `STT_CPU_THREADS=2`, `STT_BATCH_SIZE=0` (or `=4` with
   `MAX_CONCURRENT=1` for long-file workloads).
-- Reminder that `WHISPER_IDLE_UNLOAD_S` trades RAM (~450 MB) for a ~0.5 s
+- Reminder that `STT_IDLE_UNLOAD_S` trades RAM (~450 MB) for a ~0.5 s
   warm reload — keep hot for latency-critical deployments.
 
 ### H. Reproduce-the-baseline env presets (README + docker-compose)
@@ -261,11 +265,11 @@ new `max_concurrent` instead of inheriting a stale snapshot.
 | Baseline row | Env preset |
 | --- | --- |
 | default `beam=5/best=5` | *(no env — server defaults)* |
-| `beam=2/best=2` | `WHISPER_BEAM_SIZE=2` `WHISPER_BEST_OF=2` |
-| beam2 + trimmed schedule | `WHISPER_BEAM_SIZE=2` `WHISPER_BEST_OF=2` `WHISPER_TEMPERATURES=0,0.2,0.4` |
-| Batched bs4 beam2 | `WHISPER_BEAM_SIZE=2` `WHISPER_BEST_OF=2` `WHISPER_BATCH_SIZE=4` |
-| beam2 + VAD | `WHISPER_BEAM_SIZE=2` `WHISPER_BEST_OF=2` `WHISPER_VAD=true` |
-| `cpu_threads=1 / 2 / 4` | `WHISPER_CPU_THREADS=1` (or `2`, `4`) |
+| `beam=2/best=2` | `STT_BEAM_SIZE=2` `STT_BEST_OF=2` |
+| beam2 + trimmed schedule | `STT_BEAM_SIZE=2` `STT_BEST_OF=2` `STT_TEMPERATURES=0,0.2,0.4` |
+| Batched bs4 beam2 | `STT_BEAM_SIZE=2` `STT_BEST_OF=2` `STT_BATCH_SIZE=4` |
+| beam2 + VAD | `STT_BEAM_SIZE=2` `STT_BEST_OF=2` `STT_VAD=true` |
+| `cpu_threads=1 / 2 / 4` | `STT_CPU_THREADS=1` (or `2`, `4`) |
 
 - Each preset must also appear as a commented block in `docker-compose.yml`
   (same comment style as the existing knob blocks), tagged with the expected
@@ -276,7 +280,7 @@ new `max_concurrent` instead of inheriting a stale snapshot.
   absolute seconds).
 - **Drift guard test** (same philosophy as the `/health` field assertions): a
   unit test parses `README.md` and `docker-compose.yml` and asserts every
-  `WHISPER_*` knob referenced in the preset table appears in both files —
+  `STT_*` knob referenced in the preset table appears in both files —
   so knobs and docs cannot silently diverge.
 
 ---
@@ -285,14 +289,14 @@ new `max_concurrent` instead of inheriting a stale snapshot.
 
 | Env | Default | Meaning | Phase |
 | --- | --- | --- | --- |
-| `WHISPER_BEAM_SIZE` | `5` | Beam width (2 ≈ 2× on multi-window clips; gate on accuracy) | 1 |
-| `WHISPER_BEST_OF` | `5` | Sampling candidates when `temperature > 0` | 1 |
-| `WHISPER_TEMPERATURES` | *(fw default)* | Comma-separated fallback schedule, e.g. `0,0.2,0.4` | 1 |
-| `WHISPER_CPU_THREADS` | *(fw default)* | CT2 intra-op threads (`cores / max_concurrent` guidance) | 1 |
-| `WHISPER_BATCH_SIZE` | `0` | `BatchedInferencePipeline` batch (0 = sequential) | 2 |
-| `WHISPER_BATCH_MIN_SECONDS` | `0` | With a batch size, batch only clips ≥ this duration (0 = always) | 2 follow-up |
-| `WHISPER_VAD` | `false` | Silero VAD pre-pass (only for silence-heavy inputs) | 3 |
-| `WHISPER_HF_OFFLINE` | `false` | `local_files_only` on (re)load; no hub round-trip | 3 |
+| `STT_BEAM_SIZE` | `5` | Beam width (2 ≈ 2× on multi-window clips; gate on accuracy) | 1 |
+| `STT_BEST_OF` | `5` | Sampling candidates when `temperature > 0` | 1 |
+| `STT_TEMPERATURES` | *(fw default)* | Comma-separated fallback schedule, e.g. `0,0.2,0.4` | 1 |
+| `STT_CPU_THREADS` | *(fw default)* | CT2 intra-op threads (`cores / max_concurrent` guidance) | 1 |
+| `STT_BATCH_SIZE` | `0` | `BatchedInferencePipeline` batch (0 = sequential) | 2 |
+| `STT_BATCH_MIN_SECONDS` | `0` | With a batch size, batch only clips ≥ this duration (0 = always) | 2 follow-up |
+| `STT_VAD` | `false` | Silero VAD pre-pass (only for silence-heavy inputs) | 3 |
+| `STT_HF_OFFLINE` | `false` | `local_files_only` on (re)load; no hub round-trip | 3 |
 
 Each phase updates: `app.py` (+ `/health` reporting of effective knobs),
 README env table + "latency tuning" section, `docker-compose.yml` commented
@@ -318,8 +322,8 @@ knobs, and both suites. Phases stay individually green and ship separately.
 ## Implementation status
 
 - **Phase 0** ✅ `bfb4f13` — thread-safe inference-pool init (eager lifespan init, double-checked lock, `_reset_inference_pool`), 5 RED empty-except fixes, plan doc.
-- **Phase 1** ✅ — `WHISPER_BEAM_SIZE`/`WHISPER_BEST_OF`/`WHISPER_TEMPERATURES`/`WHISPER_CPU_THREADS` env knobs + `_parse_temperatures` + `_build_kwargs`/loader forwarding + `/health` reporting; 14 unit + 4 e2e tests. **Accuracy gate: FAIL to flip** — jfk + Italian TTS clips showed beam2 parity is *run-dependent* (jfk/buongiorno/stazione passed, `grazie mille per il tuo aiuto` degraded to `per il tuo aiuto` on one utterance; one run also drifted on ciao + stazione). Defaults stay `beam=5/best=5`; knobs are opt-in. README latency-tuning table + env rows, compose knob comments.
-- **Phase 2** ✅ — `WHISPER_BATCH_SIZE` (0 = sequential; >0 wraps the model in `BatchedInferencePipeline`). Correctness + SSE progressiveness asserted always; the `< 0.75×` wall-time gate is **opt-in** (`PERF_WALLTIME=1`) because shared-host noise reversed one-shot ratios (observed 0.56×–1.44×); with the gate active on a quiet host it measured 0.33×.
-- **Phase 3** ✅ — `WHISPER_VAD` (`vad_filter=True`), `WHISPER_HF_OFFLINE` (`local_files_only=True`), per-stage rolling p50/p95 (`upload/duration/language/inference/total`, 200-sample window) at `/health.latency_ms` (13 unit tests in `tests/test_timings.py` + 2 e2e offline); README ops runbook (one resident model per host — the 3–4 s contention floor is an ops problem) + **3H** env-preset table ↔ compose preset blocks with drift-guard `tests/test_plan_docs.py` (app.py ⇄ README config ⇄ preset table ⇄ compose are bidirectionally consistent).
+- **Phase 1** ✅ — `STT_BEAM_SIZE`/`STT_BEST_OF`/`STT_TEMPERATURES`/`STT_CPU_THREADS` env knobs + `_parse_temperatures` + `_build_kwargs`/loader forwarding + `/health` reporting; 14 unit + 4 e2e tests. **Accuracy gate: FAIL to flip** — jfk + Italian TTS clips showed beam2 parity is *run-dependent* (jfk/buongiorno/stazione passed, `grazie mille per il tuo aiuto` degraded to `per il tuo aiuto` on one utterance; one run also drifted on ciao + stazione). Defaults stay `beam=5/best=5`; knobs are opt-in. README latency-tuning table + env rows, compose knob comments.
+- **Phase 2** ✅ — `STT_BATCH_SIZE` (0 = sequential; >0 wraps the model in `BatchedInferencePipeline`). Correctness + SSE progressiveness asserted always; the `< 0.75×` wall-time gate is **opt-in** (`PERF_WALLTIME=1`) because shared-host noise reversed one-shot ratios (observed 0.56×–1.44×); with the gate active on a quiet host it measured 0.33×.
+- **Phase 3** ✅ — `STT_VAD` (`vad_filter=True`), `STT_HF_OFFLINE` (`local_files_only=True`), per-stage rolling p50/p95 (`upload/duration/language/inference/total`, 200-sample window) at `/health.latency_ms` (13 unit tests in `tests/test_timings.py` + 2 e2e offline); README ops runbook (one resident model per host — the 3–4 s contention floor is an ops problem) + **3H** env-preset table ↔ compose preset blocks with drift-guard `tests/test_plan_docs.py` (app.py ⇄ README config ⇄ preset table ⇄ compose are bidirectionally consistent).
 - **Docs follow-ups** ✅ `5990ab5` `a79dc90` — measured per-knob **accuracy** gate on the reference corpus (README “Accuracy impact per knob” + same-corpus best-of-2 timings): `cpu_threads` accuracy-neutral (byte-identical transcripts at 1/2/4), `beam=2` measurably *worse* on short phrases (`come stai` → “o messa'i”; keeps `beam=5`), trimmed schedule ≈ neutral (unseeded `>0` fallback flakes 1/5 passes), `batch_size=4` no regression.
-- **Single-request latency follow-up** ✅ — text-only fast path (`without_timestamps=True` for `text`/`timestamps=false`, no segment dicts when unused), no duplicate upload copy (Starlette's buffered `UploadFile` is passed straight through), adaptive batching via `WHISPER_BATCH_MIN_SECONDS` using the duration already probed for the size guard, explicit batched `vad_filter=True` (the pipeline requires VAD or `clip_timestamps` to chunk audio), and constrained language detection under `_inference_lock` (decoding only the 30 s detection window instead of the whole upload). New unit coverage in `tests/test_tuning.py`/`tests/test_robustness.py`; README/compose/config surface updated behind the drift guard.
+- **Single-request latency follow-up** ✅ — text-only fast path (`without_timestamps=True` for `text`/`timestamps=false`, no segment dicts when unused), no duplicate upload copy (Starlette's buffered `UploadFile` is passed straight through), adaptive batching via `STT_BATCH_MIN_SECONDS` using the duration already probed for the size guard, explicit batched `vad_filter=True` (the pipeline requires VAD or `clip_timestamps` to chunk audio), and constrained language detection under `_inference_lock` (decoding only the 30 s detection window instead of the whole upload). New unit coverage in `tests/test_tuning.py`/`tests/test_robustness.py`; README/compose/config surface updated behind the drift guard.

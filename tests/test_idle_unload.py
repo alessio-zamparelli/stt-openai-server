@@ -18,8 +18,10 @@ from typing import Any, Iterator, List
 import pytest
 from fastapi.testclient import TestClient
 
-import app as app_module
-from app import ModelStore, Settings
+import stt_api.runtime as runtime
+from stt_api.config import Settings
+from stt_api.main import app as fastapi_app
+from stt_api.services.model_store import ModelStore
 
 DEFAULT_IDLE = Settings().idle_unload_s  # 300
 
@@ -76,19 +78,19 @@ def _make_store(
 def _make_client(store: ModelStore) -> Iterator[TestClient]:
     """TestClient with the module-global store swapped for the given fake.
 
-    The routes and lifespan resolve ``app_module.store`` at call time, so
+    The routes and lifespan resolve ``runtime.store`` at call time, so
     swapping the module attribute suffices. The store uses a fast fake loader,
     so no model is downloaded. Swapping is undone after the client context
     exits. Note the lifespan calls ``store.get()`` eagerly, so the fake's
     ``reloads`` starts at 1 after the client is entered.
     """
-    original = app_module.store
-    app_module.store = store
+    original = runtime.store
+    runtime.store = store
     try:
-        with TestClient(app_module.app) as client:
+        with TestClient(fastapi_app) as client:
             yield client
     finally:
-        app_module.store = original
+        runtime.store = original
 
 
 # -- config -------------------------------------------------------------
@@ -114,7 +116,7 @@ def test_store_evicts_when_idle():
     assert store.get() is not None
     assert calls == [0]  # initial load recorded via the loader
     store._last_activity -= 10_000
-    assert store.maybe_unload(now=100_000) is True
+    assert store.maybe_unload(now=store._last_activity + store._config.idle_unload_s + 1) is True
     assert store._model is None
     assert store.loaded is False
     assert calls == [0]  # unload alone never calls the loader
@@ -136,7 +138,7 @@ def test_no_unload_when_lock_held():
     store.get()
     store._last_activity -= 10_000
     with store._lock:  # simulate an in-flight transcription
-        assert store.maybe_unload(now=100_000) is False
+        assert store.maybe_unload(now=store._last_activity + store._config.idle_unload_s + 1) is False
     assert store._model is not None
 
 
@@ -145,7 +147,7 @@ def test_reload_restores_model_after_eviction():
     store = _make_store(loader_calls=calls)
     old = store.get()
     store._last_activity -= 10_000
-    assert store.maybe_unload(now=100_000) is True
+    assert store.maybe_unload(now=store._last_activity + store._config.idle_unload_s + 1) is True
 
     fresh = store.get()  # block-until-reloaded path
     assert fresh is not None
@@ -210,7 +212,7 @@ def test_health_reflects_eviction():
     store = _make_store()
     with _make_client(store) as client:
         store._last_activity -= 10_000
-        assert store.maybe_unload(now=100_000) is True
+        assert store.maybe_unload(now=store._last_activity + store._config.idle_unload_s + 1) is True
         body = client.get("/health").json()
     assert body["status"] == "ok"  # still serving; next request wakes it
     assert body["loaded"] is False
@@ -245,7 +247,7 @@ def test_transcribe_after_eviction_serves_200():
         assert "hello world" in r1.json()["text"]
 
         store._last_activity -= 10_000
-        assert store.maybe_unload(now=100_000) is True
+        assert store.maybe_unload(now=store._last_activity + store._config.idle_unload_s + 1) is True
         assert store.loaded is False
 
         r2 = client.post(

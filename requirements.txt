@@ -3,3 +3,5 @@ fastapi>=0.100.0
 uvicorn[standard]>=0.23.0
 pydantic>=2.0.0
 python-multipart>=0.0.9
+wyoming>=1.8.0
+zeroconf>=0.132.0

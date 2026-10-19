@@ -1,82 +1,92 @@
 # Local development / self-host convenience wrapper around deploy/Dockerfile.
 # Not needed for GitHub Actions (GHCR publishes from the workflow directly).
 # Usage: docker compose up -d --build   (then POST to http://localhost:8080)
-name: whisper-api
+name: stt-api
 
 services:
-  whisper:
+  stt:
     build:
       context: .
       dockerfile: deploy/Dockerfile
-    image: whisper-api:local
+    image: stt-api:local
     ports:
       - "8080:8080"
+      # Wyoming ASR (Home Assistant). Harmless when STT_WYOMING is false.
+      - "10300:10300"
     environment:
       # Optional knobs (see README "Configuration (env vars)"). API key left unset.
-      - WHISPER_HOST=0.0.0.0
-      - WHISPER_PORT=8080
+      - STT_HOST=0.0.0.0
+      - STT_PORT=8080
+      # Wyoming ASR listener (Home Assistant integration).
+      - STT_WYOMING=true
+      - STT_WYOMING_HOST=0.0.0.0
+      - STT_WYOMING_PORT=10300
       # Model size: tiny | base (default) | small | medium | large-v3
-      # - WHISPER_MODEL_NAME=base
+      # - STT_MODEL_NAME=base
       # INT8 quantization: ~2x faster than fp32 on CPU, negligible quality loss.
-      # - WHISPER_COMPUTE_TYPE=int8
+      # - STT_COMPUTE_TYPE=int8
       # Load the model on first request instead of at startup.
-      # - WHISPER_LAZY_LOAD=false
+      # - STT_LAZY_LOAD=false
       # Idle model eviction (0 disables): drop the model from RAM after this
       # many seconds without API requests; next request reloads it (~0.5s warm).
       # Drop to a lower value (e.g. 60) if you prioritize RAM over wake cost.
-      # - WHISPER_IDLE_UNLOAD_S=300
+      # - STT_IDLE_UNLOAD_S=300
       # How often the watchdog checks the idle window (seconds).
-      # - WHISPER_IDLE_POLL_S=30
+      # - STT_IDLE_POLL_S=30
       # Default language used when a request omits `language` (ISO-639-1 code;
-      # unset = auto-detect). Pinning helps short clips: e.g. WHISPER_LANGUAGE=it
-      # - WHISPER_LANGUAGE=it
+      # unset = auto-detect). Pinning helps short clips: e.g. STT_LANGUAGE=it
+      # - STT_LANGUAGE=it
       # Comma-separated allowlist for auto-detection, e.g. detect only among
       # italian/english. A single code forces it (no detection at all); several
       # codes run a detection constrained to that set.
-      # - WHISPER_LANGUAGES=it,en
+      # - STT_LANGUAGES=it,en
       # Prompt applied whenever a request doesn't send one (conditions decode).
-      # - WHISPER_INITIAL_PROMPT=The transcript is:
+      # - STT_INITIAL_PROMPT=The transcript is:
+      # mDNS auto-discovery for Home Assistant (needs a reachable host network).
+      # - STT_WYOMING_ZEROCONF=true
+      # Friendly mDNS instance name (default: MAC-derived, unique per host).
+      # - STT_WYOMING_NAME=stt-api
       # Robustness / resource limits (see docs/PLAN-robustness-concurrency.md):
       # Max simultaneously-running transcriptions (bounded threadpool; 0=unbounded).
       # Offloads the event loop so /health stays responsive under load.
-      # - WHISPER_MAX_CONCURRENT=2
+      # - STT_MAX_CONCURRENT=2
       # Reject uploads larger than this in MB (413, streamed; 0=unlimited).
-      # - WHISPER_MAX_UPLOAD_MB=100
+      # - STT_MAX_UPLOAD_MB=100
       # Reject audio longer than this many seconds (400; 0=off). Whisper processes
       # fixed ~30s windows, so long inputs cost multiples of the per-window floor.
-      # - WHISPER_MAX_AUDIO_SECONDS=3600
+      # - STT_MAX_AUDIO_SECONDS=3600
       # Abandon-the-call timeout in seconds -> 504 (0=off).
-      # - WHISPER_REQUEST_TIMEOUT_S=300
+      # - STT_REQUEST_TIMEOUT_S=300
       # Latency tuning (see README "Latency tuning"): accuracy-first defaults;
       # enable only for latency-sensitive workloads (beam2 parity is run-dependent).
-      # - WHISPER_BEAM_SIZE=5
-      # - WHISPER_BEST_OF=5
+      # - STT_BEAM_SIZE=5
+      # - STT_BEST_OF=5
       # Trimmed fallback temperature schedule (overrides request temperature).
-      # - WHISPER_TEMPERATURES=0,0.2,0.4
-      # CT2 intra-op threads; rule of thumb: cores / WHISPER_MAX_CONCURRENT.
-      # - WHISPER_CPU_THREADS=2
+      # - STT_TEMPERATURES=0,0.2,0.4
+      # CT2 intra-op threads; rule of thumb: cores / STT_MAX_CONCURRENT.
+      # - STT_CPU_THREADS=2
       # Batch whisper's ~30 s windows (opt-in; batched ignores condition_on_previous_text).
-      # - WHISPER_BATCH_SIZE=4
+      # - STT_BATCH_SIZE=4
       # Only batch clips at least this many seconds long (0 = always; needs BATCH_SIZE).
-      # - WHISPER_BATCH_MIN_SECONDS=30
+      # - STT_BATCH_MIN_SECONDS=30
       # VAD pre-filter (sparse/quiet audio; net cost on all-speech clips).
-      # - WHISPER_VAD=true
+      # - STT_VAD=true
       # Offline mode: local_files_only=True, never touch the HF hub.
-      # - WHISPER_HF_OFFLINE=true
+      # - STT_HF_OFFLINE=true
       # --- Presets (README "Reproduce the measured baseline") ---
       # Enable one preset at a time (tokens below are drift-guarded by tests):
-      #   beam2 (≈2x):          WHISPER_BEAM_SIZE=2 WHISPER_BEST_OF=2
-      #   trimmed schedule:     WHISPER_TEMPERATURES=0,0.2,0.4
-      #   batched (≈4.3x):      WHISPER_BATCH_SIZE=4
-      #   adaptive batching:    WHISPER_BATCH_SIZE=4 WHISPER_BATCH_MIN_SECONDS=30
-      #   VAD (cost on dense audio): WHISPER_VAD=true
-      #   cpu_threads=2:        WHISPER_CPU_THREADS=2
+      #   beam2 (≈2x):          STT_BEAM_SIZE=2 STT_BEST_OF=2
+      #   trimmed schedule:     STT_TEMPERATURES=0,0.2,0.4
+      #   batched (≈4.3x):      STT_BATCH_SIZE=4
+      #   adaptive batching:    STT_BATCH_SIZE=4 STT_BATCH_MIN_SECONDS=30
+      #   VAD (cost on dense audio): STT_VAD=true
+      #   cpu_threads=2:        STT_CPU_THREADS=2
     volumes:
       # Persistent model weights across restarts (HF_HOME=/data/hf).
-      - whisper-data:/data
+      - stt-data:/data
     restart: unless-stopped
     healthcheck:
-      # app.py --healthcheck honors WHISPER_PORT and bypasses HTTP proxies.
+      # app.py --healthcheck honors STT_PORT and bypasses HTTP proxies.
       test: ["CMD", "python", "app.py", "--healthcheck"]
       interval: 30s
       timeout: 5s
@@ -87,4 +97,4 @@ services:
       retries: 3
 
 volumes:
-  whisper-data:
+  stt-data:

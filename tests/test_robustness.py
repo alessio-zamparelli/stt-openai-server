@@ -26,8 +26,12 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-import app as app_module
-from app import ModelStore, Settings, _check_content_length
+import stt_api.runtime as runtime
+import stt_api.services.inference as inference
+from stt_api.config import Settings
+from stt_api.main import app as fastapi_app
+from stt_api.services.audio import _check_content_length
+from stt_api.services.model_store import ModelStore
 
 
 # --------------------------------------------------------------------------
@@ -78,13 +82,13 @@ def _make_store(model) -> ModelStore:
 
 @contextmanager
 def _make_client(store: ModelStore, cfg: Settings):
-    orig_store, orig_cfg = app_module.store, app_module.settings
-    app_module.store, app_module.settings = store, cfg
+    orig_store, orig_cfg = runtime.store, runtime.settings
+    runtime.store, runtime.settings = store, cfg
     try:
-        with TestClient(app_module.app) as client:
+        with TestClient(fastapi_app) as client:
             yield client
     finally:
-        app_module.store, app_module.settings = orig_store, orig_cfg
+        runtime.store, runtime.settings = orig_store, orig_cfg
 
 
 def _wav(seconds: float, rate: int = 16000, channels: int = 1, bits: int = 16) -> bytes:
@@ -177,7 +181,7 @@ def test_transcribe_collect_skips_segment_dicts_for_text():
         def transcribe(self, audio, **kwargs):
             return iter([_MinimalSeg(), _MinimalSeg()]), Info("en")
 
-    segments, _info, text = app_module._transcribe_collect(
+    segments, _info, text = inference._transcribe_collect(
         _Runner(), "/tmp/probe.wav", {}, collect_segments=False
     )
     assert segments == []
@@ -402,14 +406,14 @@ def test_health_reports_robustness_fields():
 
 def test_inference_pool_concurrent_init_returns_same_executor():
     """16 threads hammering the getter must all see ONE executor (race guard)."""
-    orig = app_module.settings
-    app_module.settings = Settings(idle_unload_s=0, max_concurrent=2)
-    app_module._reset_inference_pool()
+    orig = runtime.settings
+    runtime.settings = Settings(idle_unload_s=0, max_concurrent=2)
+    runtime._reset_inference_pool()
     try:
         results = []
 
         def worker():
-            results.append(app_module._inference_pool())
+            results.append(runtime._inference_pool())
 
         threads = [threading.Thread(target=worker) for _ in range(16)]
         for t in threads:
@@ -420,42 +424,42 @@ def test_inference_pool_concurrent_init_returns_same_executor():
         assert results[0] is not None
         assert results[0]._max_workers == 2
     finally:
-        app_module.settings = orig
-        app_module._reset_inference_pool()
+        runtime.settings = orig
+        runtime._reset_inference_pool()
 
 
 def test_inference_pool_rebuilt_after_settings_swap():
-    orig = app_module.settings
-    app_module.settings = Settings(idle_unload_s=0, max_concurrent=4)
-    app_module._reset_inference_pool()
+    orig = runtime.settings
+    runtime.settings = Settings(idle_unload_s=0, max_concurrent=4)
+    runtime._reset_inference_pool()
     try:
-        pool = app_module._inference_pool()
+        pool = runtime._inference_pool()
         assert pool is not None
         assert pool._max_workers == 4
     finally:
-        app_module.settings = orig
-        app_module._reset_inference_pool()
+        runtime.settings = orig
+        runtime._reset_inference_pool()
 
 
 def test_inference_pool_unbounded_returns_none():
-    orig = app_module.settings
-    app_module.settings = Settings(idle_unload_s=0, max_concurrent=0)
-    app_module._reset_inference_pool()
+    orig = runtime.settings
+    runtime.settings = Settings(idle_unload_s=0, max_concurrent=0)
+    runtime._reset_inference_pool()
     try:
-        assert app_module._inference_pool() is None
+        assert runtime._inference_pool() is None
     finally:
-        app_module.settings = orig
-        app_module._reset_inference_pool()
+        runtime.settings = orig
+        runtime._reset_inference_pool()
 
 
 def test_lifespan_inits_and_resets_pool():
     model = FakeModel()
     cfg = Settings(idle_unload_s=0, max_concurrent=2)
-    app_module._reset_inference_pool()
+    runtime._reset_inference_pool()
     with _make_client(_make_store(model), cfg):
-        assert app_module._inference_executor is not None
-        assert app_module._inference_executor._max_workers == 2
-    assert app_module._inference_executor is None  # shutdown resets
+        assert runtime._inference_executor is not None
+        assert runtime._inference_executor._max_workers == 2
+    assert runtime._inference_executor is None  # shutdown resets
 
 
 # --------------------------------------------------------------------------
@@ -523,7 +527,7 @@ def test_inference_serialized_across_concurrent_collects():
     results: List[Any] = []
     _run_concurrent(
         lambda: results.append(
-            app_module._transcribe_collect(probe, "/tmp/probe.wav", {})
+            inference._transcribe_collect(probe, "/tmp/probe.wav", {})
         )
     )
     assert len(results) == 2
@@ -536,7 +540,7 @@ def test_stream_worker_serialized_across_concurrent_calls():
     producers never overlap and both still emit done+end."""
     probe = _SerializeProbe()
     q: "queue.SimpleQueue" = queue.SimpleQueue()
-    _run_concurrent(lambda: app_module._stream_worker(probe, "/tmp/probe.wav", {}, q))
+    _run_concurrent(lambda: inference._stream_worker(probe, "/tmp/probe.wav", {}, q))
     kinds = []
     while not q.empty():
         kinds.append(q.get())

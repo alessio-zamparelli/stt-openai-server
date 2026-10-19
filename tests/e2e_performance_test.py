@@ -2,13 +2,13 @@
 model (docs/PLAN-performance.md).
 
 Phase 1 (this file's core today):
-  - Tuned server (WHISPER_BEAM_SIZE=2, WHISPER_BEST_OF=2,
-    WHISPER_TEMPERATURES=0,0.2,0.4) still transcribes jfk with the expected
+  - Tuned server (STT_BEAM_SIZE=2, STT_BEST_OF=2,
+    STT_TEMPERATURES=0,0.2,0.4) still transcribes jfk with the expected
     phrase and no repetition loop; /health reports the effective knobs.
 
 Phase 2 adds: batched server < 0.75x sequential wall-time on the 88s clip;
              SSE still streams progressively on the batched server.
-Phase 3 adds: offline (WHISPER_HF_OFFLINE + HF_HUB_OFFLINE) reload e2e and
+Phase 3 adds: offline (STT_HF_OFFLINE + HF_HUB_OFFLINE) reload e2e and
              per-stage latency_ms at /health.
 
 Run:  uv run pytest tests/e2e_performance_test.py -v
@@ -44,9 +44,9 @@ def server_tuned(tmp_path_factory):
     with _server(
         tmp_path_factory,
         {
-            "WHISPER_BEAM_SIZE": "2",
-            "WHISPER_BEST_OF": "2",
-            "WHISPER_TEMPERATURES": "0,0.2,0.4",
+            "STT_BEAM_SIZE": "2",
+            "STT_BEST_OF": "2",
+            "STT_TEMPERATURES": "0,0.2,0.4",
         },
     ) as url:
         yield url
@@ -59,13 +59,13 @@ def client_tuned(server_tuned):
 
 
 # ---------------------------------------------------------------------------
-# Phase 2 — opt-in batched inference (WHISPER_BATCH_SIZE)
+# Phase 2 — opt-in batched inference (STT_BATCH_SIZE)
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="session")
 def server_batched(tmp_path_factory):
-    """WHISPER_BATCH_SIZE=4 — BatchedInferencePipeline opt-in mode."""
-    with _server(tmp_path_factory, {"WHISPER_BATCH_SIZE": "4"}) as url:
+    """STT_BATCH_SIZE=4 — BatchedInferencePipeline opt-in mode."""
+    with _server(tmp_path_factory, {"STT_BATCH_SIZE": "4"}) as url:
         yield url
 
 
@@ -76,7 +76,7 @@ def client_batched(server_batched):
 
 
 # ---------------------------------------------------------------------------
-# Phase 3 — offline mode (WHISPER_HF_OFFLINE) + VAD knob knob reported
+# Phase 3 — offline mode (STT_HF_OFFLINE) + VAD knob knob reported
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="session")
@@ -84,7 +84,7 @@ def server_offline(tmp_path_factory):
     """local_files_only=True + HF_HUB_OFFLINE=1: no HF hub round-trip."""
     with _server(
         tmp_path_factory,
-        {"WHISPER_HF_OFFLINE": "true", "HF_HUB_OFFLINE": "1"},
+        {"STT_HF_OFFLINE": "true", "HF_HUB_OFFLINE": "1"},
     ) as url:
         yield url
 

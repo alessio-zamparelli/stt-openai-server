@@ -1,4 +1,9 @@
-# PLAN — RAM footprint: idle model eviction (whisper-api)
+# PLAN — RAM footprint: idle model eviction (stt-api)
+
+> **Layout note (post-refactor):** implementation moved from the single-file
+> `app.py` to the `stt_api/` package (`services/model_store.py`,
+> `services/wyoming.py`, `routers/`, `runtime.py`). Env vars are now `STT_*`;
+> `WHISPER_*` remains a deprecated alias. `app.py` is a compatibility launcher.
 
 > **Goal:** when the API has had no transcription/translation request for a
 > configurable window (default 5 min), drop the in-RAM faster-whisper model so
@@ -109,8 +114,8 @@ wm = store.get()          # returns WhisperModel (reloads if evicted)
 
 ### 3. Watchdog in `lifespan` (mirrors reference `_idle_watchdog`)
 
-- `Settings` gains `idle_unload_s: int = 300` (`WHISPER_IDLE_UNLOAD_S`, `0`=
-  off) and `idle_poll_s: int = 30` (`WHISPER_IDLE_POLL_S`).
+- `Settings` gains `idle_unload_s: int = 300` (`STT_IDLE_UNLOAD_S`, `0`=
+  off) and `idle_poll_s: int = 30` (`STT_IDLE_POLL_S`).
 - In `lifespan`, when `settings.idle_unload_s > 0`, spawn a **daemon** thread
   (`threading.Event` stop signal) that loops `stop.wait(poll_s)` →
   `store.maybe_unload()`. `poll_s = min(settings.idle_poll_s,
@@ -141,9 +146,9 @@ Extend the existing endpoint to expose the eviction state (mirrors reference):
 ### 5. Config plumbing (`Settings`)
 
 - Add `idle_unload_s` / `idle_poll_s` fields with the same explicit
-  `_env_int` binding pattern already used for `WHISPER_PORT`:
-  `idle_unload_s=_env_int("WHISPER_IDLE_UNLOAD_S", 300)`,
-  `idle_poll_s=_env_int("WHISPER_IDLE_POLL_S", 30)`.
+  `_env_int` binding pattern already used for `STT_PORT`:
+  `idle_unload_s=_env_int("STT_IDLE_UNLOAD_S", 300)`,
+  `idle_poll_s=_env_int("STT_IDLE_POLL_S", 30)`.
 - `docker-compose.yml`: add the two commented env knobs to the existing
   "Optional knobs" block. Dockerfile needs **no change** (runtime config only).
 - README: add both vars to the Configuration table; note `/data` volume keeps
@@ -158,7 +163,7 @@ Port the reference's `tests/test_idle_unload.py` shape, but for our app:
 - **Explicit clock:** `maybe_unload(now=...)` and direct `_last_activity`
   mutation make all idle timers deterministic.
 - New test module `tests/test_idle_unload.py`:
-  - config: `WHISPER_IDLE_UNLOAD_S` parse; `0` disables / no watchdog thread.
+  - config: `STT_IDLE_UNLOAD_S` parse; `0` disables / no watchdog thread.
   - store: not loaded before first `get`; `get` loads once (single-flight under
     6 threads ⇒ loader called once); `maybe_unload` evicts when idle, no-ops
     when recent or when `idle_unload_s == 0`; `malloc_trim` wrapped in try/except.
@@ -188,7 +193,7 @@ Port the reference's `tests/test_idle_unload.py` shape, but for our app:
   `malloc_trim` gets most back (measured 507→108). If eviction still shows
   slack, attempt `wm.model.unload()` (ctranslate2 model has no public unload
   in our version) — dropping the Python ref + gc + trim is sufficient (measured).
-- **`WHISPER_LAZY_LOAD` interaction:** independent. `lazy_load` controls the
+- **`STT_LAZY_LOAD` interaction:** independent. `lazy_load` controls the
   *initial* load timing (startup vs. first request); idle-unload controls
   *subsequent* drops. They compose: both on ⇒ model loads on request, evicts
   when idle, reloads on next request.

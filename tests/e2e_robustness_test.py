@@ -7,7 +7,7 @@ Boots real faster-whisper servers as subprocesses (no mocks) and verifies:
   - Phase 1: 413 on oversized uploads; /health stays responsive (event loop
              not blocked) during a long transcription; unexpected file suffixes
              still decode (PyAV sniffs bytes).
-  - Phase 2: 400 on audio longer than WHISPER_MAX_AUDIO_SECONDS.
+  - Phase 2: 400 on audio longer than STT_MAX_AUDIO_SECONDS.
   - Phase 3: real OpenAI-style SSE streaming (stream=true).
 
 Run:  uv run pytest tests/e2e_robustness_test.py -v
@@ -38,11 +38,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SAMPLE_URL = "https://github.com/openai/whisper/raw/main/tests/jfk.flac"
 EXPECTED_PHRASE = "my fellow americans"
 STARTUP_TIMEOUT_S = 180
-SAMPLE_CACHE = Path(tempfile.gettempdir()) / "whisper_api_test_jfk.flac"
+SAMPLE_CACHE = Path(tempfile.gettempdir()) / "stt_api_test_jfk.flac"
 
 
 # ---------------------------------------------------------------------------
-# Server booting (real app.py subprocess, WHISPER_* env) — shared shape
+# Server booting (real app.py subprocess, STT_* env) — shared shape
 # ---------------------------------------------------------------------------
 
 def _free_port() -> int:
@@ -57,11 +57,11 @@ def _server(tmp_path_factory, extra_env: dict):
     log_path = tmp_path_factory.mktemp("server") / "server.log"
     env = os.environ.copy()
     env.update(
-        WHISPER_HOST="127.0.0.1",
-        WHISPER_PORT=str(port),
-        WHISPER_MODEL_NAME="base",
-        WHISPER_COMPUTE_TYPE="int8",
-        WHISPER_IDLE_UNLOAD_S="0",
+        STT_HOST="127.0.0.1",
+        STT_PORT=str(port),
+        STT_MODEL_NAME="base",
+        STT_COMPUTE_TYPE="int8",
+        STT_IDLE_UNLOAD_S="0",
         PYTHONUNBUFFERED="1",
         **extra_env,
     )
@@ -115,7 +115,7 @@ def speech_sample():
             )
         return SAMPLE_CACHE, True
     except httpx.HTTPError:
-        tone = Path(tempfile.gettempdir()) / "whisper_api_test_tone.wav"
+        tone = Path(tempfile.gettempdir()) / "stt_api_test_tone.wav"
         with wave.open(str(tone), "wb") as w:
             w.setnchannels(1)
             w.setsampwidth(2)
@@ -130,10 +130,10 @@ def speech_sample():
 
 @pytest.fixture(scope="session")
 def server_limits(tmp_path_factory):
-    """WHISPER_MAX_UPLOAD_MB=1 and WHISPER_MAX_AUDIO_SECONDS=5."""
+    """STT_MAX_UPLOAD_MB=1 and STT_MAX_AUDIO_SECONDS=5."""
     with _server(
         tmp_path_factory,
-        {"WHISPER_MAX_UPLOAD_MB": "1", "WHISPER_MAX_AUDIO_SECONDS": "5"},
+        {"STT_MAX_UPLOAD_MB": "1", "STT_MAX_AUDIO_SECONDS": "5"},
     ) as url:
         yield url
 
@@ -141,7 +141,7 @@ def server_limits(tmp_path_factory):
 @pytest.fixture(scope="session")
 def server_responsive(tmp_path_factory):
     """Default robustness knobs (100 MB upload / 3600 s audio / timeout on)."""
-    with _server(tmp_path_factory, {"WHISPER_MAX_CONCURRENT": "2"}) as url:
+    with _server(tmp_path_factory, {"STT_MAX_CONCURRENT": "2"}) as url:
         yield url
 
 
@@ -163,7 +163,7 @@ def long_wav_bytes(speech_sample, tmp_path_factory):
     sample, is_speech = speech_sample
     if not is_speech:
         return None
-    cached = Path(tempfile.gettempdir()) / "whisper_api_test_long.wav"
+    cached = Path(tempfile.gettempdir()) / "stt_api_test_long.wav"
     if not cached.exists():
         from faster_whisper.audio import decode_audio
 

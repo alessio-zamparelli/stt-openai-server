@@ -1,5 +1,10 @@
 # PLAN — Robustness: event-loop offload, resource limits, upload hygiene
 
+> **Layout note (post-refactor):** implementation moved from `app.py` to
+> `stt_api/` (`routers/`, `services/audio.py`, `services/inference.py`,
+> `runtime.py`). Env vars are now `STT_*`; `WHISPER_*` remains a deprecated
+> alias.
+
 > **Goal:** make the server safe to run behind a real load balancer / on shared
 > hardware. Today inference runs *on the event loop* (serializing all other
 > requests, including `/health`, behind one transcription), there is no
@@ -47,7 +52,7 @@ and currently run inline in `async def` handlers.**
   (Alternative — converting endpoints to sync `def` — also works via Starlette's
   default 40-thread pool, but we want explicit control of the pool + bound.)
 - **Bounded concurrency:** `Settings` gains `max_concurrent: int = 2`
-  (`WHISPER_MAX_CONCURRENT`). A `threading.Semaphore` held *only* around the
+  (`STT_MAX_CONCURRENT`). A `threading.Semaphore` held *only* around the
   inference chunk (not around `/health`, not around the upload write) caps
   simultaneous transcriptions so CPU stays responsive and latency predictable.
 - **Thread-safety verification step:** confirm two concurrent `transcribe()` on
@@ -82,7 +87,7 @@ async def _drain_upload(file: UploadFile, tmp, limit: int) -> int:
   aborted **mid-stream** (no wasted disk/CPU, temp file unlinked in `finally`).
 - Fast path: if `Content-Length` is present and exceeds the cap, return 413
   before reading the body.
-- New knob `WHISPER_MAX_UPLOAD_MB: int = 100` (conservative vs. OpenAI's 25 MB;
+- New knob `STT_MAX_UPLOAD_MB: int = 100` (conservative vs. OpenAI's 25 MB;
   a 30 s window keeps per-request memory bounded regardless of byte size).
 - Status is **413** (payload too large) with an OpenAI-style detail body; the
   existing "Abandon Bad Input" 400/422 tests keep passing.
@@ -128,7 +133,7 @@ def _safe_suffix(filename: str | None) -> str:
 
 ### D. Max-audio-duration guard
 
-- New knob `WHISPER_MAX_AUDIO_SECONDS: int = 3600` (0 = off). After the temp
+- New knob `STT_MAX_AUDIO_SECONDS: int = 3600` (0 = off). After the temp
   write, read container duration cheaply via PyAV metadata
   (`av.open(path).streams.audio[0].duration / time_base`) — **no model load, ~
   ms**. Unknown duration (non-seekable/odd containers) → log and skip the guard.
@@ -138,10 +143,10 @@ def _safe_suffix(filename: str | None) -> str:
 
 ### E. Inference request timeout (abandon-the-call semantics)
 
-- New knob `WHISPER_REQUEST_TIMEOUT_S: int = 300`. Run the whole inference chunk
+- New knob `STT_REQUEST_TIMEOUT_S: int = 300`. Run the whole inference chunk
   in the threadpool and await it with `asyncio.wait_for`; on timeout: return
   **504**, unlink the temp, and let the orphaned thread *drain in the threadpool*
-  (CTranslate2 cannot be preempted from Python). `WHISPER_MAX_CONCURRENT` bounds
+  (CTranslate2 cannot be preempted from Python). `STT_MAX_CONCURRENT` bounds
   how many such drained threads can stack, so this cannot grow unboundedly.
 - Documented as a backstop: the duration guard (D) already rejects the realistic
   pathological cases before the model even runs.
@@ -171,10 +176,10 @@ def _safe_suffix(filename: str | None) -> str:
 
 | Env | Default | Meaning | Phase |
 | --- | --- | --- | --- |
-| `WHISPER_MAX_CONCURRENT` | `2` | Concurrent transcriptions cap (0 = unbounded) | 1 |
-| `WHISPER_MAX_UPLOAD_MB` | `100` | Upload size cap → 413 | 1 |
-| `WHISPER_MAX_AUDIO_SECONDS` | `3600` | Audio-duration cap → 400 (0 = off) | 2 |
-| `WHISPER_REQUEST_TIMEOUT_S` | `300` | Inference timeout → 504 (abandon-call) | 2 |
+| `STT_MAX_CONCURRENT` | `2` | Concurrent transcriptions cap (0 = unbounded) | 1 |
+| `STT_MAX_UPLOAD_MB` | `100` | Upload size cap → 413 | 1 |
+| `STT_MAX_AUDIO_SECONDS` | `3600` | Audio-duration cap → 400 (0 = off) | 2 |
+| `STT_REQUEST_TIMEOUT_S` | `300` | Inference timeout → 504 (abandon-call) | 2 |
 
 Each phase updates: `app.py` (+`/health` reporting where useful), the README env
 table + troubleshooting, `docker-compose.yml` commented knobs, and the suites
@@ -186,12 +191,12 @@ table + troubleshooting, `docker-compose.yml` commented knobs, and the suites
   Phase-1 fallback: a module-level serialize lock (`_inference_lock`) wraps
   `transcribe()` **and** the lazy segment iteration in both
   `_transcribe_collect` and `_stream_worker`, so concurrent requests queue on
-  the shared model instead of racing it. `WHISPER_MAX_CONCURRENT` now bounds
+  the shared model instead of racing it. `STT_MAX_CONCURRENT` now bounds
   the *queue*, not parallel decodes; `/health` never touches the lock. Guarded
   by 2 unit tests (`test_inference_serialized_across_concurrent_collects`,
   `test_stream_worker_serialized_across_concurrent_calls`).
 - **Timed-out orphan threads** briefly hold a model + worker slot; bounded by
-  `WHISPER_MAX_CONCURRENT`; acceptable backstop semantics (documented).
+  `STT_MAX_CONCURRENT`; acceptable backstop semantics (documented).
 - **413 (bytes) vs 400 (duration)** deliberately split; note the divergence from
   OpenAI (which 400s too-long audio) in the README.
 - `stream=true` is shipped but still lacks a genuine external SSE client for

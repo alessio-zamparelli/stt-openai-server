@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# whisper-api — OpenAI-compatible Whisper server (CPU-only).
+# stt-api — OpenAI-compatible speech-to-text server (CPU-only).
 #
 # Built with uv, following the reference pattern in
 # pocket-tts-openai-server/deploy/Dockerfile and the official uv Docker guide:
@@ -18,8 +18,8 @@
 # CPU-only by design: faster-whisper runs on CTranslate2's CPU backend with
 # INT8 quantization — no CUDA/NVIDIA layers, no torch wheels.
 #
-# Build:    docker build -f deploy/Dockerfile -t whisper-api .
-# Run:      docker run --rm -p 8080:8080 -v whisper-data:/data whisper-api
+# Build:    docker build -f deploy/Dockerfile -t stt-api .
+# Run:      docker run --rm -p 8080:8080 -v stt-data:/data stt-api
 #
 # The first startup downloads the base model (~140 MB int8) into /data/hf.
 # Mount /data as a volume so weights persist across restarts.
@@ -62,32 +62,33 @@ RUN apt-get update \
 ENV PATH="/app/.venv/bin:$PATH" \
     UV_PYTHON_DOWNLOADS=0 \
     PYTHONUNBUFFERED=1 \
-    WHISPER_HOST=0.0.0.0 \
-    WHISPER_PORT=8080 \
-    WHISPER_MODEL_NAME=base \
-    WHISPER_COMPUTE_TYPE=int8 \
+    STT_HOST=0.0.0.0 \
+    STT_PORT=8080 \
+    STT_MODEL_NAME=base \
+    STT_COMPUTE_TYPE=int8 \
     HF_HOME=/data/hf
 
 WORKDIR /app
 COPY --from=builder /app/.venv /app/.venv
 COPY app.py ./
+COPY stt_api ./stt_api
 
 # Non-root runtime user; /data must stay writable for downloaded model weights.
-RUN useradd --create-home --uid 10001 whisper \
+RUN useradd --create-home --uid 10001 stt \
     && mkdir -p /data/hf \
-    && chown -R whisper:whisper /data
+    && chown -R stt:stt /data
 
 # Persistent volume: HF model weights (HF_HOME=/data/hf). Mount it to avoid
 # re-downloading the model on every container restart.
 VOLUME ["/data"]
 
-USER whisper
-EXPOSE 8080
+USER stt
+EXPOSE 8080 10300
 
 # The eager model load happens inside FastAPI's lifespan startup, before
 # uvicorn binds the port. The first boot therefore answers "connection
 # refused" until the ~140 MB model download finishes, so allow a generous
-# start period (the probe itself honors WHISPER_PORT inside app.py).
+# start period (the probe itself honors STT_PORT inside app.py).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=600s --retries=3 \
     CMD ["python", "app.py", "--healthcheck"]
 

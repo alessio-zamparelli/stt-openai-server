@@ -44,7 +44,12 @@ jobs:
           uv run python - <<'EOF'
           from fastapi.openapi.utils import get_openapi
           import app
-          schema = get_openapi(title="whisper-api", version="0.1.0", routes=app.app.routes)
+          import stt_api.main
+          import stt_api.services.wyoming
+          schema = get_openapi(
+              title="stt-api", version=stt_api.main.__version__,
+              routes=stt_api.main.app.routes,
+          )
           expected = {
               "/v1/audio/transcriptions",
               "/v1/audio/translations",
@@ -53,8 +58,9 @@ jobs:
           }
           missing = expected - set(schema.get("paths", {}))
           assert not missing, f"missing routes: {missing}"
-          assert app.settings.model_name == "base"
-          assert app.settings.compute_type == "int8"
+          assert stt_api.main.runtime.settings.model_name == "base"
+          assert stt_api.main.runtime.settings.compute_type == "int8"
+          assert app.app is stt_api.main.app
           print("smoke test OK:", sorted(expected))
           EOF
 

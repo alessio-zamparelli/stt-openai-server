@@ -1,8 +1,8 @@
-# whisper-api
+# stt-api
 
 **OpenAI-compatible speech-to-text server powered by [faster-whisper](https://github.com/SYSTRAN/faster-whisper).**
 
-`whisper-api` exposes `/v1/audio/transcriptions` and `/v1/audio/translations`
+`stt-api` exposes `/v1/audio/transcriptions` and `/v1/audio/translations`
 with the same request shapes OpenAI clients already use. It runs entirely on
 CPU through CTranslate2, defaults to the `base` model with INT8 quantization,
 and ships with a small production-oriented FastAPI server: bounded concurrency,
@@ -11,9 +11,14 @@ latency metrics, and idle model eviction.
 
 - CPU only — no CUDA, no PyTorch, no NVIDIA layers.
 - OpenAI-compatible transcription, translation, and model listing.
+- Optional Wyoming ASR listener for Home Assistant (with mDNS discovery).
 - One resident model per process, with optional eviction after an idle window.
 - Docker image built with `uv`, run as a non-root user, with a persistent model
   cache and a built-in healthcheck.
+
+> **Renamed:** environment variables now use the `STT_*` prefix. The historical
+> `WHISPER_*` names still work as deprecated aliases for one release, and
+> `STT_*` wins when both are set. The engine is still faster-whisper.
 
 ---
 
@@ -28,6 +33,7 @@ latency metrics, and idle model eviction.
   - [Models, health, and docs](#get-v1models--get-health--get-docs)
   - [Response formats](#response-formats)
   - [Errors](#errors)
+- [Wyoming protocol (Home Assistant)](#wyoming-protocol-home-assistant)
 - [Architecture](#architecture)
   - [Request lifecycle](#request-lifecycle)
   - [Model lifecycle and idle eviction](#model-lifecycle-and-idle-eviction)
@@ -56,6 +62,7 @@ latency metrics, and idle model eviction.
 | Speech translation | `POST /v1/audio/translations` into English |
 | Output formats | `json`, `text`, `srt`, `vtt`, `verbose_json` |
 | Streaming | OpenAI-style SSE for both audio endpoints (`stream=true`) |
+| Wyoming ASR | Optional TCP listener (`:10300`) for Home Assistant, with optional zeroconf |
 | Model selection | Server-owned; request `model` is accepted and ignored |
 | Language control | Per request, server default, constrained allowlist, or auto-detect |
 | Decoding controls | Beam width, `best_of`, temperature schedule, VAD, batching, CPU threads |
@@ -66,7 +73,7 @@ latency metrics, and idle model eviction.
 
 The server uses **one shared `WhisperModel` instance**. faster-whisper /
 CTranslate2 is not safe for concurrent `transcribe()` calls on one instance, so
-decodes are serialized with a lock. `WHISPER_MAX_CONCURRENT` bounds the request
+decodes are serialized with a lock. `STT_MAX_CONCURRENT` bounds the request
 queue and keeps setup work off the event loop; it does not create parallel
 decoders on the same model.
 
@@ -88,18 +95,20 @@ curl http://localhost:8080/v1/models
 ```
 
 The first start downloads the `base` model (~140 MB INT8) into the
-`whisper-data` volume. Later starts reuse it.
+`stt-data` volume. Later starts reuse it.
 
 ### Docker one-liner
 
 ```bash
-docker run --rm -p 8080:8080 \
-  -v whisper-data:/data \
-  ghcr.io/<owner>/whisper-api:latest
+docker run --rm -p 8080:8080 -p 10300:10300 \
+  -e STT_WYOMING=true \
+  -v stt-data:/data \
+  ghcr.io/<owner>/stt-openai-server:latest
 ```
 
 Replace `<owner>` with the GitHub owner that published the image through the
-workflow in `.github/workflows/docker-publish.yml`.
+workflow in `.github/workflows/docker-publish.yml`. Drop the `10300` mapping and
+`STT_WYOMING=true` if you only need the HTTP API.
 
 ### Local with `uv`
 
@@ -115,20 +124,22 @@ pip install -r requirements.txt
 python app.py
 ```
 
-The app is a single module (`app.py`) and is deliberately **not installed** as a
-package (`package = false` in `pyproject.toml`). Run it from the repository root
-so `app` is importable.
+The app lives in the `stt_api/` package; `app.py` is a compatibility launcher
+that keeps `python app.py` and `--healthcheck` working. You can also run
+`uv run uvicorn stt_api.main:app` or `uv run stt-api`. With `package = true` in
+`pyproject.toml`, the package is installed into the repo-local `.venv` by
+`uv sync`.
 
 ### First startup behaviour
 
 The model is loaded eagerly inside FastAPI's lifespan startup, **before uvicorn
-binds the port**, unless `WHISPER_LAZY_LOAD=true`. During a cold Docker start:
+binds the port**, unless `STT_LAZY_LOAD=true`. During a cold Docker start:
 
 - the container stays in Docker's `starting` health state;
 - local health probes may log `connection refused`;
 - the built-in healthcheck allows a 10-minute start period.
 
-Set `WHISPER_LAZY_LOAD=true` if you want the HTTP server to bind immediately and
+Set `STT_LAZY_LOAD=true` if you want the HTTP server to bind immediately and
 load the model on the first API request instead. With idle eviction enabled, the
 same warm reload path is used after eviction.
 
@@ -138,8 +149,9 @@ same warm reload path is used after eviction.
 
 All audio endpoints consume `multipart/form-data`. The scalar fields are
 declared as form fields, not query parameters, so send them with `-F` in curl or
-`data=` in an HTTP client. The Pydantic request models in `app.py` document the
-OpenAI shape but the live endpoints require multipart uploads.
+`data=` in an HTTP client. The Pydantic request models in
+`stt_api/schemas.py` document the OpenAI shape but the live endpoints require
+multipart uploads.
 
 ### `POST /v1/audio/transcriptions`
 
@@ -157,11 +169,11 @@ curl -X POST http://localhost:8080/v1/audio/transcriptions \
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `file` | file | required | Audio upload. The field name must be `file`. |
-| `model` | string | — | Accepted for OpenAI compatibility and **ignored**. The served model is always `WHISPER_MODEL_NAME`. |
+| `model` | string | — | Accepted for OpenAI compatibility and **ignored**. The served model is always `STT_MODEL_NAME`. |
 | `language` | ISO-639-1 string | server default | Source language hint, e.g. `en`, `it`. Empty/whitespace counts as absent. |
-| `prompt` | string | `WHISPER_INITIAL_PROMPT` | Decoder prompt. The per-request value wins over the server default. |
+| `prompt` | string | `STT_INITIAL_PROMPT` | Decoder prompt. The per-request value wins over the server default. |
 | `response_format` | string | `json` | `json`, `text`, `srt`, `vtt`, or `verbose_json`. |
-| `temperature` | float, 0–1 | `0.0` | Sampling temperature. Ignored when `WHISPER_TEMPERATURES` is set. |
+| `temperature` | float, 0–1 | `0.0` | Sampling temperature. Ignored when `STT_TEMPERATURES` is set. |
 | `timestamps` | bool | `true` | When false, JSON responses omit `segments` (`segments: null`). |
 | `stream` | bool | `false` | Return SSE instead of the chosen response format. See [Streaming](#streaming-responses-streamtrue). |
 
@@ -253,7 +265,7 @@ Notes:
   non-streaming path, so only one decode runs on the model at a time.
 - The buffered upload is owned by the stream generator and is closed only after
   the producer drains, including client disconnects.
-- The timeout (`WHISPER_REQUEST_TIMEOUT_S`) applies to the non-streaming call.
+- The timeout (`STT_REQUEST_TIMEOUT_S`) applies to the non-streaming call.
   A streaming response is drained/closed by the generator lifecycle.
 - SSE parity with a specific OpenAI SDK stream consumer is best-effort; the
   events above are the server's own contract.
@@ -262,7 +274,7 @@ Notes:
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /v1/models` | OpenAI-shaped list with one model: the configured `WHISPER_MODEL_NAME`. |
+| `GET /v1/models` | OpenAI-shaped list with one model: the configured `STT_MODEL_NAME`. |
 | `GET /health` | Liveness, effective configuration, lifecycle counters, and rolling stage timings. |
 | `GET /docs` | Interactive Swagger UI generated by FastAPI. |
 | `GET /openapi.json` | OpenAPI schema. |
@@ -310,12 +322,23 @@ samples):
   "batch_min_seconds": 0,
   "vad_filter": false,
   "hf_offline": false,
+  "wyoming": {
+    "enabled": true,
+    "host": "0.0.0.0",
+    "port": 10300,
+    "zeroconf": false,
+    "name": null,
+    "requests": 12,
+    "errors": 0,
+    "active": 0
+  },
   "latency_ms": {
     "upload": {"n": 10, "p50_ms": 0.1, "p95_ms": 0.3},
     "duration": {"n": 10, "p50_ms": 0.8, "p95_ms": 1.5},
     "language": {"n": 10, "p50_ms": 1.2, "p95_ms": 2.0},
     "inference": {"n": 10, "p50_ms": 1370.2, "p95_ms": 2200.0},
-    "total": {"n": 10, "p50_ms": 1400.0, "p95_ms": 2300.0}
+    "total": {"n": 10, "p50_ms": 1400.0, "p95_ms": 2300.0},
+    "wyoming": {"n": 4, "p50_ms": 1420.0, "p95_ms": 2100.0}
   }
 }
 ```
@@ -348,11 +371,11 @@ OpenAI's nested `{"error": {...}}` envelope.
 
 | Status | Cause |
 | --- | --- |
-| `400` | Invalid `response_format`; unsupported `language`; audio longer than `WHISPER_MAX_AUDIO_SECONDS`. |
-| `413` | Upload larger than `WHISPER_MAX_UPLOAD_MB`. Checked from `Content-Length` at route entry and from the buffered upload size before inference; neither can run before FastAPI parses the multipart body. |
+| `400` | Invalid `response_format`; unsupported `language`; audio longer than `STT_MAX_AUDIO_SECONDS`. |
+| `413` | Upload larger than `STT_MAX_UPLOAD_MB`. Checked from `Content-Length` at route entry and from the buffered upload size before inference; neither can run before FastAPI parses the multipart body. |
 | `422` | Missing/invalid required form field (for example no `file`, or a temperature outside 0–1). |
 | `500` | Unexpected decode/inference failure. The detail is the exception string. |
-| `504` | Inference exceeded `WHISPER_REQUEST_TIMEOUT_S`. CTranslate2 cannot be preempted; the abandoned call drains in the bounded pool. |
+| `504` | Inference exceeded `STT_REQUEST_TIMEOUT_S`. CTranslate2 cannot be preempted; the abandoned call drains in the bounded pool. |
 
 An empty upload is rejected without crashing the process; the server remains
 healthy afterwards.
@@ -403,6 +426,100 @@ extensions still decode.
 
 ---
 
+## Wyoming protocol (Home Assistant)
+
+The server can expose a Wyoming ASR endpoint so Home Assistant can use it as a
+speech-to-text provider. It is **opt-in** and shares the same model, idle
+eviction, language rules, and inference serialization as the HTTP API.
+
+### Enable it
+
+```bash
+docker run --rm -p 8080:8080 -p 10300:10300 \
+  -e STT_WYOMING=true \
+  -v stt-data:/data \
+  ghcr.io/<owner>/stt-openai-server:latest
+```
+
+Local:
+
+```bash
+STT_WYOMING=true uv run python app.py
+```
+
+The listener binds `0.0.0.0:10300` by default. Configure it with
+`STT_WYOMING_HOST`, `STT_WYOMING_PORT`, and `STT_WYOMING_NAME`.
+
+### Add it to Home Assistant
+
+Without discovery:
+
+1. **Settings → Devices & services → Add integration → Wyoming Protocol**.
+2. Enter the host running this server and port `10300`.
+
+With mDNS auto-discovery, set `STT_WYOMING_ZEROCONF=true`. The service is
+registered as `<STT_WYOMING_NAME or MAC>._wyoming._tcp.local.`. Docker bridge
+networking often blocks mDNS; use `network_mode: host` or manual host/port.
+
+### Event flow
+
+```text
+client → describe
+client ← info            (asr program "stt-api", model = STT_MODEL_NAME)
+client → transcribe      (optional language; name is ignored)
+client → audio-start
+client → audio-chunk*    (raw PCM)
+client → audio-stop
+client ← transcript      ({text, language})
+                         (server then closes the connection)
+```
+
+### Behaviour and limits
+
+- **One utterance per connection.** Home Assistant opens a connection per
+  request; the server closes it after `transcript`, matching the reference
+  `wyoming-faster-whisper` server.
+- **Audio is normalized** to 16 kHz mono 16-bit PCM. Native Home Assistant
+  chunks are already in that format, so the converter is a no-op.
+- **Language**: the `transcribe.language` hint wins, then `STT_LANGUAGE`, then a
+  multi-code `STT_LANGUAGES` allowlist, then auto-detect. `"auto"`, empty values,
+  and region-qualified tags (`en-US`) are normalized. An unsupported code logs a
+  warning and falls back instead of dropping the connection.
+- **Model name is ignored.** Like the HTTP `model` field, `transcribe.name` is
+  accepted for compatibility but the served model is always `STT_MODEL_NAME`.
+- **VAD is external.** `info` advertises `requires_external_vad=true`; Home
+  Assistant/its satellite detects the end of the command and sends
+  `audio-stop`.
+- **Limits** mirror the HTTP API: accumulated PCM is checked against
+  `STT_MAX_AUDIO_SECONDS` and `STT_MAX_UPLOAD_MB` while chunks arrive. An
+  oversized utterance returns `transcript` with an empty `text` and is logged.
+- **Failures** (decode error, timeout, empty audio) also return an empty
+  transcript; Wyoming has no error event. Check logs and `/health.wyoming.errors`.
+- **No interim streaming.** `supports_transcript_streaming` is `false`; one final
+  transcript is sent after `audio-stop` (the Home Assistant Whisper app behaves
+  the same way).
+- **Idle eviction**: `transcribe`/`audio-stop` count as API activity;
+  `describe` does not, and `describe` never loads the model.
+- **No authentication or encryption.** Wyoming is designed for a trusted
+  network; do not expose port `10300` to the internet.
+
+`/health.wyoming` reports the listener state and counters:
+
+```json
+"wyoming": {
+  "enabled": true,
+  "host": "0.0.0.0",
+  "port": 10300,
+  "zeroconf": false,
+  "name": null,
+  "requests": 12,
+  "errors": 0,
+  "active": 0
+}
+```
+
+---
+
 ## Architecture
 
 ### High-level flow
@@ -413,12 +530,14 @@ extensions still decode.
 │ curl / client   │                          │ /v1/audio/transcriptions │
 └─────────────────┘                          │ /v1/audio/translations   │
                                              └────────────┬─────────────┘
-                                                          │
+┌─────────────────┐   Wyoming JSONL + PCM                 │
+│ Home Assistant  │ ───────────────────────▶ :10300 ──────┤
+└─────────────────┘                                      │
                      ┌────────────────────────────────────┼──────────────────────────────┐
                      │                                    │                              │
                      ▼                                    ▼                              ▼
           use buffered UploadFile                 resolve language / limits       bounded thread pool
-          (Starlette SpooledTemporaryFile)        (PyAV metadata, allowlist)     (WHISPER_MAX_CONCURRENT)
+          (Starlette SpooledTemporaryFile)        (PyAV metadata, allowlist)     (STT_MAX_CONCURRENT)
                      │                                    │                              │
                      └────────────────────────────────────┼──────────────────────────────┘
                                                           ▼
@@ -427,14 +546,17 @@ extensions still decode.
                                             inference serialized by _inference_lock
                                                           │
                                                           ▼
-                                            segments → OpenAI JSON / text / SRT / VTT
-                                            or SSE events when stream=true
+                                            HTTP: OpenAI JSON / text / SRT / VTT
+                                            HTTP: SSE when stream=true
+                                            Wyoming: transcript
 ```
 
-The runtime is intentionally a single module. `app.py` contains the settings,
-the `ModelStore`, FastAPI routes, response formatting, concurrency helpers, the
-SSE producer, and the healthcheck entrypoint. There is no `src/` package and no
-application framework beyond FastAPI/Starlette.
+The runtime is a FastAPI package (`stt_api/`). `main.py` owns the app and
+lifespan; `routers/` contains the HTTP surface; `services/` contains model
+lifecycle, audio/language/inference helpers, response formatting, and the
+Wyoming listener; `runtime.py` owns the process-wide settings, model store,
+inference pool, lock, and stage timings. `app.py` is a thin compatibility
+launcher for `python app.py` and `--healthcheck`.
 
 ### Request lifecycle
 
@@ -451,18 +573,18 @@ Both audio routes follow the same sequence:
    multipart body into an `UploadFile` backed by a `SpooledTemporaryFile`
    (1 MB in memory, then disk). The route passes that file-like object to
    PyAV/faster-whisper instead of copying it to a second temp file, and
-   enforces `WHISPER_MAX_UPLOAD_MB` from `UploadFile.size` before inference.
+   enforces `STT_MAX_UPLOAD_MB` from `UploadFile.size` before inference.
 6. **Probe container duration** with PyAV metadata. No model load; over the
-   `WHISPER_MAX_AUDIO_SECONDS` cap → `400`. The same duration selects the
-   runner when `WHISPER_BATCH_MIN_SECONDS > 0`.
+   `STT_MAX_AUDIO_SECONDS` cap → `400`. The same duration selects the
+   runner when `STT_BATCH_MIN_SECONDS > 0`.
 7. **Resolve the language** (client field → server default → allowlist →
    constrained detection → full auto). Multi-code allowlists decode only the
    first 30 s window, run faster-whisper's detector, then pick the
    highest-probability allowed code.
 8. **Build decoding kwargs** from the server settings and request fields. The
    runner is constructed here: `BatchedInferencePipeline` when
-   `WHISPER_BATCH_SIZE > 0` and (if set) the clip meets
-   `WHISPER_BATCH_MIN_SECONDS`. Text-only output (`text` / `timestamps=false`)
+   `STT_BATCH_SIZE > 0` and (if set) the clip meets
+   `STT_BATCH_MIN_SECONDS`. Text-only output (`text` / `timestamps=false`)
    sets `without_timestamps` and skips building segment dictionaries.
 9. **Run inference off the event loop** in the bounded pool. The shared-model
    serialization lock covers both `transcribe()` and the lazy segment
@@ -482,21 +604,21 @@ Both audio routes follow the same sequence:
 | --- | --- |
 | `get()` | Return the model; if absent, invoke the loader under a lock. Concurrent callers share one rebuild. Increments `reloads`. |
 | `touch()` | Record real API activity. Called only by audio routes. |
-| `maybe_unload(now)` | If idle past `WHISPER_IDLE_UNLOAD_S`, acquire the store lock non-blocking, clear the model, run `gc.collect()`, and best-effort `malloc_trim(0)`. Returns whether it evicted. |
+| `maybe_unload(now)` | If idle past `STT_IDLE_UNLOAD_S`, acquire the store lock non-blocking, clear the model, run `gc.collect()`, and best-effort `malloc_trim(0)`. Returns whether it evicted. |
 | `last_request_age()` | Seconds since the last API request; exposed by `/health`. |
 
 The lifespan starts a daemon watchdog only when eviction is enabled. The actual
 poll interval is:
 
 ```text
-min(WHISPER_IDLE_POLL_S, max(5, WHISPER_IDLE_UNLOAD_S // 2))
+min(STT_IDLE_POLL_S, max(5, STT_IDLE_UNLOAD_S // 2))
 ```
 
 The measured behavior on the reference host (`base`/INT8, CPU) is roughly
 `507 MB → 108 MB` after eviction, with a warm reload of about `0.5 s` from the
 HF cache. Mount `/data` so that cache survives container restarts.
 
-`WHISPER_LAZY_LOAD` and `WHISPER_IDLE_UNLOAD_S` compose:
+`STT_LAZY_LOAD` and `STT_IDLE_UNLOAD_S` compose:
 
 - lazy load controls the **initial** load (startup vs first request);
 - idle eviction controls **subsequent** drops;
@@ -506,9 +628,9 @@ HF cache. Mount `/data` so that cache survives container restarts.
 
 - Blocking chunks (`store.get`, duration probing, language detection,
   `transcribe` and segment iteration) run in a `ThreadPoolExecutor` when
-  `WHISPER_MAX_CONCURRENT > 0`. The pool is initialized eagerly in the lifespan
+  `STT_MAX_CONCURRENT > 0`. The pool is initialized eagerly in the lifespan
   and protected by double-checked locking.
-- `WHISPER_MAX_CONCURRENT=0` switches to Starlette/anyio's threadpool and is
+- `STT_MAX_CONCURRENT=0` switches to Starlette/anyio's threadpool and is
   effectively unbounded. The default is `2`.
 - `_inference_lock` serializes all decodes on the shared model. With
   `max_concurrent=2`, two requests can be prepared at once, but only one can
@@ -516,7 +638,7 @@ HF cache. Mount `/data` so that cache survives container restarts.
   pool/queue instead of racing the model.
 - `/health` remains responsive while inference runs because the event loop is
   never blocked by CTranslate2 (it releases the GIL).
-- `WHISPER_REQUEST_TIMEOUT_S` abandons the wait and returns `504`; the worker
+- `STT_REQUEST_TIMEOUT_S` abandons the wait and returns `504`; the worker
   thread and model decode continue until they finish. The pool bound prevents
   orphaned calls from growing without limit.
 - There is no API-level rate limiter or queue-depth metric. Use a reverse proxy
@@ -524,14 +646,14 @@ HF cache. Mount `/data` so that cache survives container restarts.
 
 Sizing guidance:
 
-- Inference is serialized, so size `WHISPER_CPU_THREADS` near the available
+- Inference is serialized, so size `STT_CPU_THREADS` near the available
   physical cores (or leave `0` to let faster-whisper decide). More threads than
   cores oversubscribes the single decode.
-- `WHISPER_MAX_CONCURRENT` bounds queued/setup work, not parallel decodes.
-- Batched mode (`WHISPER_BATCH_SIZE > 0`) has a different CPU profile: batch
+- `STT_MAX_CONCURRENT` bounds queued/setup work, not parallel decodes.
+- Batched mode (`STT_BATCH_SIZE > 0`) has a different CPU profile: batch
   size × intra-op threads is the footprint. For long files, a common starting
   point is `MAX_CONCURRENT=1`, `BATCH_SIZE=4`, `CPU_THREADS=2`, then measure.
-- Run one resident model per host/CPU quota. Multiple whisper containers on one
+- Run one resident model per host/CPU quota. Multiple STT containers on one
   CPU produce cold-start and queue contention; prefer fewer, larger instances or
   batched mode over many small ones.
 
@@ -541,8 +663,8 @@ Priority, highest first:
 
 1. Per-request `language` (transcriptions only). Empty/whitespace is treated as
    absent.
-2. `WHISPER_LANGUAGE` (`default_language`).
-3. `WHISPER_LANGUAGES` allowlist:
+2. `STT_LANGUAGE` (`default_language`).
+3. `STT_LANGUAGES` allowlist:
    - **one code** → forced for every request, no detection;
    - **multiple codes** → decode only the first 30 s window, run
      faster-whisper's detector, then choose the highest-probability code inside
@@ -557,18 +679,21 @@ also reported in JSON responses as the detected/effective language.
 
 `lifespan` startup:
 
-1. Eagerly load the model unless `WHISPER_LAZY_LOAD=true`.
+1. Eagerly load the model unless `STT_LAZY_LOAD=true`.
 2. Eagerly create the inference pool with the configured worker count.
-3. Start the idle watchdog if `WHISPER_IDLE_UNLOAD_S > 0`.
-4. Yield to uvicorn.
+3. Start the idle watchdog if `STT_IDLE_UNLOAD_S > 0`.
+4. Start the Wyoming listener if `STT_WYOMING=true` (bind failure aborts
+   startup; zeroconf failure only logs a warning).
+5. Yield to uvicorn.
 
 `lifespan` shutdown:
 
-1. Set the watchdog stop event.
-2. Close and drop the inference pool.
+1. Stop the Wyoming listener and unregister zeroconf.
+2. Set the watchdog stop event.
+3. Close and drop the inference pool.
 
 `python app.py --healthcheck` runs a one-shot `http.client` probe against
-`/health`. It honors `WHISPER_HOST`/`WHISPER_PORT` (including a `0.0.0.0` bind),
+`/health`. It honors `STT_HOST`/`STT_PORT` (including a `0.0.0.0` bind),
 bypasses `HTTP(S)_PROXY`, and returns a single diagnostic line instead of a
 traceback while the model is still loading.
 
@@ -576,34 +701,56 @@ traceback while the model is still loading.
 
 ```text
 .
-├── app.py                         # settings, ModelStore, routes, SSE, concurrency
+├── app.py                         # compatibility launcher (python app.py / --healthcheck)
+├── stt_api/
+│   ├── __init__.py                # version
+│   ├── main.py                    # FastAPI app, lifespan, CLI
+│   ├── config.py                  # Settings + STT_*/WHISPER_* env resolution
+│   ├── runtime.py                 # settings/store, pool, lock, timings
+│   ├── dependencies.py            # get_settings(), get_store()
+│   ├── schemas.py                 # Pydantic request/response models
+│   ├── routers/
+│   │   ├── transcriptions.py      # POST /v1/audio/transcriptions
+│   │   ├── translations.py        # POST /v1/audio/translations
+│   │   └── system.py              # GET /v1/models, /health
+│   └── services/
+│       ├── model_store.py         # ModelStore, idle eviction
+│       ├── audio.py               # limits, duration, prefix decode
+│       ├── formatting.py          # JSON/text/SRT/VTT
+│       ├── language.py            # language resolution
+│       ├── inference.py           # kwargs, batching, SSE
+│       └── wyoming.py             # Wyoming ASR listener + zeroconf
 ├── tests/
+│   ├── test_config.py             # STT_* / legacy alias resolution
 │   ├── test_idle_unload.py        # eviction/reload unit tests
 │   ├── test_language.py           # language resolution tests
-│   ├── test_plan_docs.py          # README/compose/app.py drift guard
+│   ├── test_plan_docs.py          # README/compose/package drift guard
 │   ├── test_robustness.py         # limits, timeout, SSE, pool, serialization
 │   ├── test_timings.py            # rolling stage statistics
 │   ├── test_tuning.py             # decoding-kwarg plumbing
+│   ├── test_wyoming.py            # Wyoming protocol unit/integration tests
 │   ├── e2e_test.py                # real server, real model, all endpoints
 │   ├── e2e_language_test.py       # language behaviour on a real model
 │   ├── e2e_robustness_test.py     # resource guards against a real server
+│   ├── e2e_wyoming_test.py        # Wyoming round-trip on a real model
 │   └── e2e_performance_test.py    # opt-in wall-time assertions
 ├── docs/
 │   ├── PLAN-idle-unload.md
 │   ├── PLAN-performance.md
-│   └── PLAN-robustness-concurrency.md
+│   ├── PLAN-robustness-concurrency.md
+│   └── PLAN-wyoming.md
 ├── deploy/
 │   └── Dockerfile                 # multi-stage CPU-only uv image
 ├── docker-compose.yml             # local build/run convenience
-├── pyproject.toml                 # uv project + pytest config
+├── pyproject.toml                 # uv package + pytest config
 ├── uv.lock                        # pinned dependency graph
 ├── requirements.txt               # pip fallback
 └── .github/workflows/
     └── docker-publish.yml         # smoke gate + GHCR publish
 ```
 
-Docker copies **only `app.py`** into the runtime image. If you add runtime
-modules, data files, or a `src/` layout, update `deploy/Dockerfile` or the
+Docker copies `app.py` and the `stt_api/` package into the runtime image. If you
+add another runtime module or data file, update `deploy/Dockerfile` or the
 container will fail at import/startup.
 
 ---
@@ -616,31 +763,40 @@ process (or construct `Settings(...)` in tests). Integers/floats with bad
 values fall back to their defaults; booleans accept `1`, `true`, `yes`, `on`
 (case-insensitive).
 
+Canonical names use `STT_*`. Every knob also accepts the legacy `WHISPER_*`
+spelling for one release; `STT_*` wins when both are set and a one-time warning
+is logged for each legacy variable.
+
 | Variable | Default | Description |
 | --- | --- | --- |
-| `WHISPER_MODEL_NAME` | `base` | faster-whisper model size or local CTranslate2 model path. Tested sizes: `tiny`, `base`, `small`, `medium`, `large-v3`, `large-v3-turbo`. |
-| `WHISPER_COMPUTE_TYPE` | `int8` | CTranslate2 compute type passed to `WhisperModel`. Common CPU values: `int8`, `int8_float32`, `int16`, `float32`. GPU-only types require GPU builds, which this image does not ship. |
-| `WHISPER_DEVICE` | `cpu` | Device passed to faster-whisper. The project is designed for `cpu`; the image has no CUDA libraries. |
-| `WHISPER_HOST` | `0.0.0.0` | uvicorn bind host. |
-| `WHISPER_PORT` | `8080` | uvicorn bind port and healthcheck port. |
-| `WHISPER_LAZY_LOAD` | `false` | Defer the initial model load until the first API request. The server binds immediately. |
-| `WHISPER_IDLE_UNLOAD_S` | `300` | Evict the model from RAM after this many seconds without API requests. `0` disables eviction. Next API request reloads (~0.5 s warm cache). |
-| `WHISPER_IDLE_POLL_S` | `30` | Watchdog poll interval. The effective interval is capped at `max(5, idle_unload_s // 2)`. |
-| `WHISPER_LANGUAGE` | *(auto)* | Default language when a request omits `language`. ISO-639-1 code such as `it`. Pinning stabilizes short/low-quality clips. |
-| `WHISPER_LANGUAGES` | *(auto)* | Comma-separated allowlist, e.g. `it,en`. One code forces it; multiple codes constrain detection to that set (decoding only the first 30 s window). |
-| `WHISPER_INITIAL_PROMPT` | *(none)* | Decoder prompt used when a request sends none. The per-request `prompt` wins. |
-| `WHISPER_MAX_CONCURRENT` | `2` | Size of the bounded inference/setup thread pool. `0` = unbounded Starlette pool. Bounds queued work; decodes still serialize on one model. |
-| `WHISPER_MAX_UPLOAD_MB` | `100` | Reject uploads over this many MB with `413`, from `Content-Length` (route entry) and the buffered upload size, both before inference. `0` = unlimited. FastAPI parses the multipart body before the route runs, so an oversized body is already buffered when it is rejected. |
-| `WHISPER_MAX_AUDIO_SECONDS` | `3600` | Reject audio longer than this container duration with an OpenAI-style `400`, before the model runs. `0` = off. |
-| `WHISPER_REQUEST_TIMEOUT_S` | `300` | Abandon-the-call inference timeout → `504`. CTranslate2 cannot be preempted; the orphan drains in the pool. `0` = off. |
-| `WHISPER_BEAM_SIZE` | `5` | Beam width. Accuracy-first default; `2` is faster on multi-window clips but measurably worse on short phrases. See [Tuning](#tuning-and-performance). |
-| `WHISPER_BEST_OF` | `5` | Candidate sampling when `temperature > 0`. Inert at the default `temperature=0` (beam search uses `WHISPER_BEAM_SIZE`). |
-| `WHISPER_TEMPERATURES` | *(faster-whisper default)* | Comma-separated fallback schedule, e.g. `0,0.2,0.4`. When set, it replaces the per-request `temperature` scalar. Bad values are ignored (default schedule). The `>0` fallback passes use an unseeded RNG, so borderline clips can vary run-to-run. |
-| `WHISPER_CPU_THREADS` | `0` | CTranslate2 intra-op threads. `0` = faster-whisper default. Since decodes are serialized, size near the core count; accuracy-neutral in measurements. |
-| `WHISPER_BATCH_SIZE` | `0` | `>0` enables `BatchedInferencePipeline`, which batches whisper's ~30 s windows (large speedups on long audio). Opt-in; batched mode ignores `condition_on_previous_text`, so casing/segmentation can drift. |
-| `WHISPER_BATCH_MIN_SECONDS` | `0` | With `WHISPER_BATCH_SIZE > 0`, batch only clips at least this many seconds long (probed from container metadata). `0` = always batch; unknown duration falls back to sequential. |
-| `WHISPER_VAD` | `false` | Run Silero VAD pre-filtering in sequential mode. Helps sparse/quiet audio; on dense speech it adds a full VAD pass and is a net cost. Batched mode always runs VAD because `BatchedInferencePipeline` needs speech chunks to batch. |
-| `WHISPER_HF_OFFLINE` | `false` | Load with `local_files_only=True`; never contact the Hugging Face hub. Fails fast if weights are not already cached in `HF_HOME`. |
+| `STT_MODEL_NAME` | `base` | faster-whisper model size or local CTranslate2 model path. Tested sizes: `tiny`, `base`, `small`, `medium`, `large-v3`, `large-v3-turbo`. |
+| `STT_COMPUTE_TYPE` | `int8` | CTranslate2 compute type passed to `WhisperModel`. Common CPU values: `int8`, `int8_float32`, `int16`, `float32`. GPU-only types require GPU builds, which this image does not ship. |
+| `STT_DEVICE` | `cpu` | Device passed to faster-whisper. The project is designed for `cpu`; the image has no CUDA libraries. |
+| `STT_HOST` | `0.0.0.0` | uvicorn bind host. |
+| `STT_PORT` | `8080` | uvicorn bind port and healthcheck port. |
+| `STT_LAZY_LOAD` | `false` | Defer the initial model load until the first API request. The server binds immediately. |
+| `STT_IDLE_UNLOAD_S` | `300` | Evict the model from RAM after this many seconds without API requests. `0` disables eviction. Next API request reloads (~0.5 s warm cache). |
+| `STT_IDLE_POLL_S` | `30` | Watchdog poll interval. The effective interval is capped at `max(5, idle_unload_s // 2)`. |
+| `STT_LANGUAGE` | *(auto)* | Default language when a request omits `language`. ISO-639-1 code such as `it`. Pinning stabilizes short/low-quality clips. |
+| `STT_LANGUAGES` | *(auto)* | Comma-separated allowlist, e.g. `it,en`. One code forces it; multiple codes constrain detection to that set (decoding only the first 30 s window). |
+| `STT_INITIAL_PROMPT` | *(none)* | Decoder prompt used when a request sends none. The per-request `prompt` wins. |
+| `STT_MAX_CONCURRENT` | `2` | Size of the bounded inference/setup thread pool. `0` = unbounded Starlette pool. Bounds queued work; decodes still serialize on one model. |
+| `STT_MAX_UPLOAD_MB` | `100` | Reject uploads over this many MB with `413`, from `Content-Length` (route entry) and the buffered upload size, both before inference. `0` = unlimited. FastAPI parses the multipart body before the route runs, so an oversized body is already buffered when it is rejected. |
+| `STT_MAX_AUDIO_SECONDS` | `3600` | Reject audio longer than this container duration with an OpenAI-style `400`, before the model runs. `0` = off. |
+| `STT_REQUEST_TIMEOUT_S` | `300` | Abandon-the-call inference timeout → `504`. CTranslate2 cannot be preempted; the orphan drains in the pool. `0` = off. |
+| `STT_BEAM_SIZE` | `5` | Beam width. Accuracy-first default; `2` is faster on multi-window clips but measurably worse on short phrases. See [Tuning](#tuning-and-performance). |
+| `STT_BEST_OF` | `5` | Candidate sampling when `temperature > 0`. Inert at the default `temperature=0` (beam search uses `STT_BEAM_SIZE`). |
+| `STT_TEMPERATURES` | *(faster-whisper default)* | Comma-separated fallback schedule, e.g. `0,0.2,0.4`. When set, it replaces the per-request `temperature` scalar. Bad values are ignored (default schedule). The `>0` fallback passes use an unseeded RNG, so borderline clips can vary run-to-run. |
+| `STT_CPU_THREADS` | `0` | CTranslate2 intra-op threads. `0` = faster-whisper default. Since decodes are serialized, size near the core count; accuracy-neutral in measurements. |
+| `STT_BATCH_SIZE` | `0` | `>0` enables `BatchedInferencePipeline`, which batches whisper's ~30 s windows (large speedups on long audio). Opt-in; batched mode ignores `condition_on_previous_text`, so casing/segmentation can drift. |
+| `STT_BATCH_MIN_SECONDS` | `0` | With `STT_BATCH_SIZE > 0`, batch only clips at least this many seconds long (probed from container metadata). `0` = always batch; unknown duration falls back to sequential. |
+| `STT_VAD` | `false` | Run Silero VAD pre-filtering in sequential mode. Helps sparse/quiet audio; on dense speech it adds a full VAD pass and is a net cost. Batched mode always runs VAD because `BatchedInferencePipeline` needs speech chunks to batch. |
+| `STT_HF_OFFLINE` | `false` | Load with `local_files_only=True`; never contact the Hugging Face hub. Fails fast if weights are not already cached in `HF_HOME`. |
+| `STT_WYOMING` | `false` | Enable the Wyoming ASR TCP listener for Home Assistant. |
+| `STT_WYOMING_HOST` | `0.0.0.0` | Wyoming listener bind host. |
+| `STT_WYOMING_PORT` | `10300` | Wyoming listener port. |
+| `STT_WYOMING_ZEROCONF` | `false` | Register `_wyoming._tcp.local.` over mDNS for Home Assistant auto-discovery. |
+| `STT_WYOMING_NAME` | *(MAC-derived)* | mDNS instance name. Set a unique friendly name when running multiple instances. |
 | `HF_HOME` | `/data/hf` in Docker | Hugging Face model/weights cache. Mount it persistently. |
 | `HF_HUB_OFFLINE` | *(unset)* | Library-level offline switch for `huggingface_hub`; `1` refuses network calls. Useful for air-gapped deployments/tests. faster-whisper also honors it. |
 
@@ -650,52 +806,78 @@ Uncomment only what you need; values are examples.
 
 ```sh
 # --- server / model ---
-# WHISPER_MODEL_NAME=base
-# WHISPER_COMPUTE_TYPE=int8
-# WHISPER_DEVICE=cpu
-# WHISPER_HOST=0.0.0.0
-# WHISPER_PORT=8080
-# WHISPER_LAZY_LOAD=false
-# WHISPER_IDLE_UNLOAD_S=300
-# WHISPER_IDLE_POLL_S=30
+# STT_MODEL_NAME=base
+# STT_COMPUTE_TYPE=int8
+# STT_DEVICE=cpu
+# STT_HOST=0.0.0.0
+# STT_PORT=8080
+# STT_LAZY_LOAD=false
+# STT_IDLE_UNLOAD_S=300
+# STT_IDLE_POLL_S=30
 
 # --- language / decoding ---
-# WHISPER_LANGUAGE=it
-# WHISPER_LANGUAGES=it,en
-# WHISPER_INITIAL_PROMPT=The transcript is:
-# WHISPER_BEAM_SIZE=5
-# WHISPER_BEST_OF=5
-# WHISPER_TEMPERATURES=0,0.2,0.4
-# WHISPER_CPU_THREADS=2
-# WHISPER_BATCH_SIZE=4
-# WHISPER_BATCH_MIN_SECONDS=30
-# WHISPER_VAD=true
+# STT_LANGUAGE=it
+# STT_LANGUAGES=it,en
+# STT_INITIAL_PROMPT=The transcript is:
+# STT_BEAM_SIZE=5
+# STT_BEST_OF=5
+# STT_TEMPERATURES=0,0.2,0.4
+# STT_CPU_THREADS=2
+# STT_BATCH_SIZE=4
+# STT_BATCH_MIN_SECONDS=30
+# STT_VAD=true
 
 # --- robustness / resources ---
-# WHISPER_MAX_CONCURRENT=2
-# WHISPER_MAX_UPLOAD_MB=100
-# WHISPER_MAX_AUDIO_SECONDS=3600
-# WHISPER_REQUEST_TIMEOUT_S=300
+# STT_MAX_CONCURRENT=2
+# STT_MAX_UPLOAD_MB=100
+# STT_MAX_AUDIO_SECONDS=3600
+# STT_REQUEST_TIMEOUT_S=300
+
+# --- Wyoming / Home Assistant ---
+# STT_WYOMING=true
+# STT_WYOMING_HOST=0.0.0.0
+# STT_WYOMING_PORT=10300
+# STT_WYOMING_ZEROCONF=true
+# STT_WYOMING_NAME=stt-api
 
 # --- cache / offline ---
-# WHISPER_HF_OFFLINE=true
+# STT_HF_OFFLINE=true
 # HF_HOME=/data/hf
 # HF_HUB_OFFLINE=1
 ```
 
+### Migrating from `whisper-api` / `WHISPER_*`
+
+- Env vars: `STT_*` is canonical. `WHISPER_*` still works as a deprecated
+  alias (one warning per variable); `STT_*` wins when both are set.
+- Python imports: `from stt_api.config import Settings`,
+  `import stt_api.runtime as runtime`. The old `app.settings` / `app.store`
+  module attributes no longer exist; `app.py` re-exports only the FastAPI
+  instance and `run()`.
+- CLI: `stt-api` is the new console script; `whisper-api` remains as a
+  one-release alias.
+- Docker volume: `stt-data` replaces `whisper-data`. Copy the old cache to avoid
+  re-downloading the model:
+
+  ```bash
+  docker volume create stt-data
+  docker run --rm -v whisper-data:/from -v stt-data:/to alpine \
+    sh -c 'cp -a /from/. /to/'
+  ```
+
 ### Precedence and important semantics
 
-- **`language` priority**: request field → `WHISPER_LANGUAGE` →
-  `WHISPER_LANGUAGES` (single forced / multi constrained detection) →
+- **`language` priority**: request field → `STT_LANGUAGE` →
+  `STT_LANGUAGES` (single forced / multi constrained detection) →
   faster-whisper full auto-detect.
-- **`prompt` priority**: request `prompt` → `WHISPER_INITIAL_PROMPT`.
-- **`temperature` priority**: `WHISPER_TEMPERATURES` (when non-empty) overrides
+- **`prompt` priority**: request `prompt` → `STT_INITIAL_PROMPT`.
+- **`temperature` priority**: `STT_TEMPERATURES` (when non-empty) overrides
   the request scalar. Otherwise the request `temperature` is used (default `0`).
-- **`model` is ignored**. The server always serves `WHISPER_MODEL_NAME`; this
+- **`model` is ignored**. The server always serves `STT_MODEL_NAME`; this
   keeps OpenAI SDK calls that send `whisper-1` working.
 - **`condition_on_previous_text=False`** is always set. Batched mode has its own
   windowing and does not support this option at all.
-- **`WHISPER_LANGUAGES` validation**: every allowlist entry is validated against
+- **`STT_LANGUAGES` validation**: every allowlist entry is validated against
   the model's supported languages before detection. A bad code returns `400`.
 
 ---
@@ -713,7 +895,7 @@ universal constants — machine load changes absolute timings substantially.
 | --- | ---: | ---: | --- |
 | default `beam=5/best=5` | 1.37 s | 8.35 s | accuracy-first baseline |
 | `beam=2/best=2` | 1.20 s | 4.23 s | ≈2× on long clips |
-| beam2 + `WHISPER_TEMPERATURES=0,0.2,0.4` | 1.20 s | 3.02 s | ≈2.8×; trims fallback passes |
+| beam2 + `STT_TEMPERATURES=0,0.2,0.4` | 1.20 s | 3.02 s | ≈2.8×; trims fallback passes |
 | batched `batch_size=4`, beam2 | — | 1.95 s | ≈4.3×; opt-in |
 | beam2 + VAD | — | 3.36 s | VAD is a cost on all-speech clips |
 | `cpu_threads` 1 / 2 / 4 | — | 9.31 / 5.86 / 5.51 s | saturates near cores |
@@ -727,10 +909,10 @@ Reference corpus: `jfk` plus 9 short Italian TTS clips, `base`/INT8, CPU,
 | --- | --- | --- | --- | ---: | --- |
 | default | 1/1 exact | 2/5 exact | 0/4 | 10.5 s | baseline |
 | `beam=2` + `best_of=2` | 1/1 | **1/5** | 0/4 | 7.3 s | **worse** on short phrases; one hallucination loop |
-| + `WHISPER_TEMPERATURES=0,0.2,0.4` | 1/1 | 2/5¹ | 0/4 | 9.3 s | ≈ neutral; fallback can flake on borderline clips |
-| `WHISPER_CPU_THREADS=2` | 1/1 | 2/5 | 0/4 | 11.3 s | identity: byte-identical transcripts |
-| `WHISPER_CPU_THREADS=4` | 1/1 | 2/5 | 0/4 | 11.3 s | identity: byte-identical transcripts |
-| `WHISPER_BATCH_SIZE=4` | 1/1 | 2/5 | 0/4 | 7.8 s | no measured regression; one word improved |
+| + `STT_TEMPERATURES=0,0.2,0.4` | 1/1 | 2/5¹ | 0/4 | 9.3 s | ≈ neutral; fallback can flake on borderline clips |
+| `STT_CPU_THREADS=2` | 1/1 | 2/5 | 0/4 | 11.3 s | identity: byte-identical transcripts |
+| `STT_CPU_THREADS=4` | 1/1 | 2/5 | 0/4 | 11.3 s | identity: byte-identical transcripts |
+| `STT_BATCH_SIZE=4` | 1/1 | 2/5 | 0/4 | 7.8 s | no measured regression; one word improved |
 
 ¹ `come stai` sits at the fallback threshold: 5 of 6 passes returned the correct
 text, one flaked.
@@ -744,7 +926,7 @@ Key takeaways:
 - **Batched mode showed no accuracy regression on this corpus**, but its
   structural `condition_on_previous_text=False` caveat remains.
 - **Sub-second isolated words score poorly in every config.** This is a
-  model/corpus floor, not a knob regression. Pinning `WHISPER_LANGUAGE` is the
+  model/corpus floor, not a knob regression. Pinning `STT_LANGUAGE` is the
   mitigation.
 
 ### 🧪 Reproduce the measured baseline
@@ -756,17 +938,17 @@ below appears in the configuration table and the compose file.
 | Preset | Environment | vs. default (`base`/INT8, CPU, 33 s clip) |
 | --- | --- | --- |
 | default (accuracy-first) | *(none — server defaults)* | baseline 8.35 s |
-| beam2 | `WHISPER_BEAM_SIZE=2 WHISPER_BEST_OF=2` | ≈2× faster |
-| beam2 + trimmed schedule | + `WHISPER_TEMPERATURES=0,0.2,0.4` | ≈2.8× faster |
-| batched beam2 | + `WHISPER_BATCH_SIZE=4` | ≈4.3× faster |
-| adaptive batching | + `WHISPER_BATCH_MIN_SECONDS=30` | ≈4.3× on clips ≥30 s; short clips stay sequential |
-| VAD | + `WHISPER_VAD=true` | cost on dense speech; helps silence-heavy audio |
-| CPU threads | `WHISPER_CPU_THREADS=1` / `2` / `4` | saturates near core count |
+| beam2 | `STT_BEAM_SIZE=2 STT_BEST_OF=2` | ≈2× faster |
+| beam2 + trimmed schedule | + `STT_TEMPERATURES=0,0.2,0.4` | ≈2.8× faster |
+| batched beam2 | + `STT_BATCH_SIZE=4` | ≈4.3× faster |
+| adaptive batching | + `STT_BATCH_MIN_SECONDS=30` | ≈4.3× on clips ≥30 s; short clips stay sequential |
+| VAD | + `STT_VAD=true` | cost on dense speech; helps silence-heavy audio |
+| CPU threads | `STT_CPU_THREADS=1` / `2` / `4` | saturates near core count |
 
-`WHISPER_BATCH_MIN_SECONDS` makes batching duration-aware: the duration already
+`STT_BATCH_MIN_SECONDS` makes batching duration-aware: the duration already
 probed for the size guard selects the runner per request, so short clips keep
 sequential decoding while long clips get the batched speedup. A mixed workload
-can use `WHISPER_BATCH_SIZE=4 WHISPER_BATCH_MIN_SECONDS=30` without changing
+can use `STT_BATCH_SIZE=4 STT_BATCH_MIN_SECONDS=30` without changing
 short-clip output. If the duration cannot be probed, the request stays
 sequential.
 
@@ -786,9 +968,9 @@ footprint. INT8 roughly halves memory versus FP32 and uses optimized CPU kernels
 
 ### Getting accurate short-audio transcriptions
 
-- **Pin the language.** `language="it"` or `WHISPER_LANGUAGE=it` reliably beats
+- **Pin the language.** `language="it"` or `STT_LANGUAGE=it` reliably beats
   auto-detect below ~1 s. For multilingual deployments, constrain detection with
-  `WHISPER_LANGUAGES=it,en`.
+  `STT_LANGUAGES=it,en`.
 - **Longer utterances help more than a bigger model.** Isolated words were
   ~30–60% exact over repeated trials; full phrases reached ~100% on `base`.
 - **Model size changes the failure mode, not the floor.** `base` can enter
@@ -803,12 +985,13 @@ footprint. INT8 roughly halves memory versus FP32 and uses optimized CPU kernels
 ### Stage timings
 
 `/health.latency_ms` exposes rolling `upload`, `duration`, `language`,
-`inference`, and `total` statistics. This is the first place to look if latency
-regresses: `upload` covers the post-parse size-validation step (Starlette has
-already buffered the multipart body before the route runs, so it is near zero),
-`duration` the PyAV probe, `language` constrained detection, and `inference`
-the decode configuration. There is no Prometheus endpoint; scrape `/health` or
-put it behind your monitoring proxy.
+`inference`, `total`, and `wyoming` statistics. This is the first place to look
+if latency regresses: `upload` covers the post-parse size-validation step
+(Starlette has already buffered the multipart body before the route runs, so it
+is near zero), `duration` the PyAV probe, `language` constrained detection,
+`inference` the decode configuration, and `wyoming` the end-to-end
+audio-stop → transcript path. There is no Prometheus endpoint; scrape `/health`
+or put it behind your monitoring proxy.
 
 ---
 
@@ -845,8 +1028,9 @@ Details that matter:
 - **`UV_COMPILE_BYTECODE=1`** precompiles `.pyc` files for faster startup.
 - **Bind-mounted manifests** keep `pyproject.toml` and `uv.lock` out of image
   layers; the dependency layer invalidates only when those files change.
-- **`--no-install-project`** is required because the project has
-  `package = false`; this image installs dependencies, not a wheel.
+- **`--no-install-project`** installs only dependencies into the image venv;
+  `app.py` and `stt_api/` are copied in the runtime stage instead of building a
+  wheel.
 - **`--no-dev`** excludes pytest/httpx from the runtime venv.
 - **`--no-editable`** produces a self-contained venv; no source tree is needed
   at runtime.
@@ -861,20 +1045,21 @@ RUN apt-get update \
 ENV PATH="/app/.venv/bin:$PATH" \
     UV_PYTHON_DOWNLOADS=0 \
     PYTHONUNBUFFERED=1 \
-    WHISPER_HOST=0.0.0.0 \
-    WHISPER_PORT=8080 \
-    WHISPER_MODEL_NAME=base \
-    WHISPER_COMPUTE_TYPE=int8 \
+    STT_HOST=0.0.0.0 \
+    STT_PORT=8080 \
+    STT_MODEL_NAME=base \
+    STT_COMPUTE_TYPE=int8 \
     HF_HOME=/data/hf
 WORKDIR /app
 COPY --from=builder /app/.venv /app/.venv
 COPY app.py ./
-RUN useradd --create-home --uid 10001 whisper \
+COPY stt_api ./stt_api
+RUN useradd --create-home --uid 10001 stt \
     && mkdir -p /data/hf \
-    && chown -R whisper:whisper /data
+    && chown -R stt:stt /data
 VOLUME ["/data"]
-USER whisper
-EXPOSE 8080
+USER stt
+EXPOSE 8080 10300
 HEALTHCHECK --interval=30s --timeout=5s --start-period=600s --retries=3 \
     CMD ["python", "app.py", "--healthcheck"]
 ENTRYPOINT ["python", "app.py"]
@@ -884,12 +1069,13 @@ Runtime details:
 
 - **`libgomp1`** supplies the OpenMP runtime used by CTranslate2.
 - **`ca-certificates`** allows the initial Hugging Face download.
-- **Only `app.py` is copied.** There is no `tests/`, no `docs/`, no `src/`.
-  Adding a runtime import requires updating this COPY line.
-- **Non-root**: uid `10001`, home `/home/whisper`, with `/data` writable.
+- **`app.py` + `stt_api/` are copied.** There is no `tests/`, no `docs/`, no
+  `src/`. Adding another runtime import requires updating the COPY lines.
+- **Non-root**: uid `10001`, home `/home/stt`, with `/data` writable.
 - **`/data` volume** holds `HF_HOME=/data/hf`, so weights persist across
   container recreation. A fresh volume starts cold and downloads the model.
-- **Port 8080** is exposed and set as the default bind port.
+- **Ports 8080 and 10300** are exposed; `10300` is only bound when
+  `STT_WYOMING=true`.
 - **Healthcheck** runs `python app.py --healthcheck` every 30 s, with a 5 s
   timeout, 3 retries, and a **600 s start period** because the eager model load
   happens before uvicorn binds.
@@ -901,22 +1087,26 @@ no compressed-output encoder in this server.
 ### `docker-compose.yml` walkthrough
 
 ```yaml
-name: whisper-api
+name: stt-api
 
 services:
-  whisper:
+  stt:
     build:
       context: .
       dockerfile: deploy/Dockerfile
-    image: whisper-api:local
+    image: stt-api:local
     ports:
       - "8080:8080"
+      - "10300:10300"
     environment:
-      - WHISPER_HOST=0.0.0.0
-      - WHISPER_PORT=8080
+      - STT_HOST=0.0.0.0
+      - STT_PORT=8080
+      - STT_WYOMING=true
+      - STT_WYOMING_HOST=0.0.0.0
+      - STT_WYOMING_PORT=10300
       # ...commented optional knobs...
     volumes:
-      - whisper-data:/data
+      - stt-data:/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "app.py", "--healthcheck"]
@@ -926,19 +1116,21 @@ services:
       retries: 3
 
 volumes:
-  whisper-data:
+  stt-data:
 ```
 
-- **`name`** sets the Compose project name to `whisper-api`.
+- **`name`** sets the Compose project name to `stt-api`.
 - **`build`** builds `deploy/Dockerfile` from the repository root.
-- **`image: whisper-api:local`** tags the local build; GHCR publishing is done
+- **`image: stt-api:local`** tags the local build; GHCR publishing is done
   by the workflow, not by Compose.
-- **Port mapping** `8080:8080`; change the host side only if you also keep the
-  container side at the configured `WHISPER_PORT`.
-- **Active environment**: bind host/port. Every optional knob is present as a
-  commented line, including the preset blocks. Compose comments are
-  documentation; they are not passed to the container until uncommented.
-- **Volume** `whisper-data:/data` persists the HF cache (`/data/hf`). Without it
+- **Port mapping** `8080:8080` for HTTP and `10300:10300` for Wyoming; change
+  the host side only if you also keep the container side at the configured
+  `STT_PORT` / `STT_WYOMING_PORT`.
+- **Active environment**: bind host/port plus the Wyoming listener. Every
+  optional knob is present as a commented line, including the preset blocks.
+  Compose comments are documentation; they are not passed to the container until
+  uncommented.
+- **Volume** `stt-data:/data` persists the HF cache (`/data/hf`). Without it
   every fresh container re-downloads the model.
 - **`restart: unless-stopped`** keeps the service running across daemon restarts
   and crashes.
@@ -946,21 +1138,22 @@ volumes:
   health even if a deployment overrides the image.
 
 The compose file's preset blocks mirror the README presets. Enable **one preset
-at a time**, and remember that `WHISPER_TEMPERATURES` overrides per-request
+at a time**, and remember that `STT_TEMPERATURES` overrides per-request
 `temperature`.
 
 ### Building and running
 
 ```bash
 # Build locally
-docker build -f deploy/Dockerfile -t whisper-api .
+docker build -f deploy/Dockerfile -t stt-api .
 
 # Run with a persistent cache
-docker run --rm -p 8080:8080 -v whisper-data:/data whisper-api
+docker run --rm -p 8080:8080 -p 10300:10300 -e STT_WYOMING=true \
+  -v stt-data:/data stt-api
 
 # Compose
 docker compose up -d --build
-docker compose logs -f whisper
+docker compose logs -f stt
 docker compose down
 
 # Rebuild after dependency changes
@@ -982,21 +1175,27 @@ knobs are environment variables.
   instances, or batched mode for long-file workloads.
 - **Model cache.** Always mount `/data`. It is the difference between a ~0.5 s
   warm reload and a full download.
-- **Healthcheck.** The built-in probe honors `WHISPER_PORT`, bypasses proxies,
+- **Healthcheck.** The built-in probe honors `STT_PORT`, bypasses proxies,
   and has a 10-minute cold-start grace. Do not shorten the start period unless
   the model is pre-cached in the image.
 - **Idle eviction.** Default is 5 minutes. Lower it if RAM matters more than
   wake latency; set `0` for an always-hot service. Health probes never reset the
   idle window, so monitoring cannot defeat eviction.
 - **Scaling.** Scale horizontally behind a reverse proxy
-  (`docker compose --scale whisper=N`) only if you have CPU capacity for N
+  (`docker compose --scale stt=N`) only if you have CPU capacity for N
   models. Sticky sessions are not required; every instance serves the same
   configured model.
 - **Security.** There is no built-in auth or rate limiting. Put Traefik
   forward-auth, nginx, or an API gateway in front for public deployments. The
   server also returns exception strings in `500` details and exposes
   configuration in `/health`; do not expose it directly to untrusted clients.
-- **Offline/air-gapped.** Pre-populate `/data/hf`, set `WHISPER_HF_OFFLINE=true`
+  The Wyoming listener is equally unauthenticated — publish `10300` only on a
+  trusted network, and do not expose it through the reverse proxy.
+- **Wyoming discovery.** mDNS does not cross Docker bridge networking reliably;
+  use `network_mode: host` or add the integration manually by host/port.
+  `STT_WYOMING_ZEROCONF` registration failures are warnings, not startup
+  failures.
+- **Offline/air-gapped.** Pre-populate `/data/hf`, set `STT_HF_OFFLINE=true`
   and `HF_HUB_OFFLINE=1`, and verify the model loads without network access.
 - **Provenance.** The publish workflow attaches SLSA build attestations to the
   GHCR image.
@@ -1008,14 +1207,14 @@ knobs are environment variables.
 ### Setup
 
 ```bash
-uv sync --locked              # repo-local .venv, including dev deps
-uv run python app.py          # dev server on :8080
-uv run python -c "import app" # import smoke check; does not load the model
+uv sync --locked                     # repo-local .venv, including dev deps
+uv run python app.py                 # dev server on :8080
+uv run uvicorn stt_api.main:app      # ASGI entrypoint
+uv run python -c "import stt_api.main"  # import smoke check; no model load
 ```
 
 Use `uv run python -m pytest`, not bare `uv run pytest`: the current pytest
-version does not always put the repository root on `sys.path`, and the app is
-not installed into the venv.
+version does not always put the repository root on `sys.path`.
 
 ### Unit tests (fast, offline, fake model)
 
@@ -1029,7 +1228,9 @@ They cover:
 - language precedence and constrained detection;
 - upload/duration/timeout guards, SSE, pool initialization, inference locking;
 - stage-timing statistics and decoding-kwarg plumbing;
-- a documentation drift guard for `WHISPER_*` knobs.
+- canonical `STT_*` env vars and legacy `WHISPER_*` aliases;
+- the Wyoming protocol (describe/info, transcription, limits, zeroconf);
+- a documentation drift guard for `STT_*` knobs.
 
 ### End-to-end tests (real model, real inference)
 
@@ -1037,6 +1238,7 @@ They cover:
 uv run python -m pytest tests/e2e_test.py -v
 uv run python -m pytest tests/e2e_language_test.py -v
 uv run python -m pytest tests/e2e_robustness_test.py -v
+uv run python -m pytest tests/e2e_wyoming_test.py -v
 ```
 
 Each e2e file boots a real `app.py` subprocess on a random port and waits up to
@@ -1057,10 +1259,12 @@ Run those only on quiet hardware; shared-host noise can reverse timing ratios.
 
 ### Documentation drift guard
 
-`tests/test_plan_docs.py` treats four files as sources of truth for tuning:
-`app.py`, the README configuration table, the README preset table, and
-`docker-compose.yml`. If you add/rename a `WHISPER_*` knob, update all of them
-together. The test scans tokens anywhere in those sections, including comments.
+`tests/test_plan_docs.py` treats three sources of truth for tuning: the
+`stt_api/` package, the README configuration table (plus the README preset
+table), and `docker-compose.yml`. If you add/rename a `STT_*` knob, update all of
+them together. The test scans tokens anywhere in those sections, including
+comments. `WHISPER_*` aliases are resolved generically in `config.py`, so they do
+not need per-knob documentation.
 
 ### Docker/CI
 
@@ -1070,7 +1274,8 @@ together. The test scans tokens anywhere in those sections, including comments.
   builds and pushes to GHCR on pushes to `main` and `v*.*.*` tags. There is **no
   unit/e2e test job and no PR trigger**; run the suites locally before pushing.
 - The workflow publishes `linux/amd64` only, with GHA cache and SLSA
-  attestations.
+  attestations. Docker copies `app.py` + `stt_api/`, so adding a runtime module
+  requires updating `deploy/Dockerfile`.
 
 ---
 
@@ -1081,16 +1286,20 @@ together. The test scans tokens anywhere in those sections, including comments.
 - **CPU focus.** The image has no CUDA/torch; GPU compute types are unsupported
   unless you build a custom image and add the relevant libraries.
 - **No built-in auth/rate limiting.** Use a proxy.
+- **Wyoming has no auth/encryption either.** Keep port `10300` on a trusted
+  network; it is meant for Home Assistant, not the public internet.
+- **Wyoming is final-transcript only.** No interim `transcript-chunk` streaming,
+  and no Wyoming translate event.
 - **SSE is best-effort OpenAI parity.** The server emits its own event names and
   has not been validated against every third-party SSE consumer.
-- **`WHISPER_REQUEST_TIMEOUT_S` cannot cancel CTranslate2.** It only abandons
+- **`STT_REQUEST_TIMEOUT_S` cannot cancel CTranslate2.** It only abandons
   the wait; the worker keeps running until the decode finishes.
 - **Duration probing is best-effort.** If PyAV cannot determine container
   duration, the duration guard is skipped rather than rejecting valid audio.
-- **Single module.** The Dockerfile copies only `app.py`; adding runtime files
-  requires Dockerfile changes.
+- **Package layout.** The Dockerfile copies `app.py` and `stt_api/`; adding
+  another runtime package requires Dockerfile changes.
 - **No model hot-swap.** The served model is fixed at process start by
-  `WHISPER_MODEL_NAME`.
+  `STT_MODEL_NAME`.
 
 ---
 

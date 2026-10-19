@@ -1,11 +1,11 @@
 """
 Unit tests for server-side language handling:
 
-  - WHISPER_LANGUAGE         default language (used when the request omits it)
-  - WHISPER_LANGUAGES        allowlist; a single code is forced, several codes
+  - STT_LANGUAGE         default language (used when the request omits it)
+  - STT_LANGUAGES        allowlist; a single code is forced, several codes
                              enable *constrained* detection (pick the best
                              probability among allowed languages only)
-  - WHISPER_INITIAL_PROMPT   prompt applied when the client sends none
+  - STT_INITIAL_PROMPT   prompt applied when the client sends none
 
 The resolution helper (_resolve_language) is tested directly with a fake
 WhisperModel; the routes are exercised through TestClient with the store
@@ -26,14 +26,13 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-import app as app_module
-from app import (
-    ModelStore,
-    Settings,
-    _decode_audio_prefix,
-    _resolve_language,
-    _split_allowed_languages,
-)
+import stt_api.runtime as runtime
+import stt_api.services.language as language
+from stt_api.config import Settings
+from stt_api.main import app as fastapi_app
+from stt_api.services.audio import _decode_audio_prefix
+from stt_api.services.language import _resolve_language, _split_allowed_languages
+from stt_api.services.model_store import ModelStore
 
 
 # --------------------------------------------------------------------------
@@ -75,13 +74,13 @@ def _make_store(model: FakeModel) -> ModelStore:
 @contextmanager
 def _make_client(store: ModelStore, cfg: Settings):
     """TestClient with module-global store AND settings swapped for the fakes."""
-    orig_store, orig_cfg = app_module.store, app_module.settings
-    app_module.store, app_module.settings = store, cfg
+    orig_store, orig_cfg = runtime.store, runtime.settings
+    runtime.store, runtime.settings = store, cfg
     try:
-        with TestClient(app_module.app) as client:
+        with TestClient(fastapi_app) as client:
             yield client
     finally:
-        app_module.store, app_module.settings = orig_store, orig_cfg
+        runtime.store, runtime.settings = orig_store, orig_cfg
 
 
 def _sine_wav(seconds: float = 0.3, rate: int = 16000) -> bytes:
@@ -110,19 +109,19 @@ def wav_path(tmp_path) -> str:
 
 def test_requested_language_wins_over_default(monkeypatch):
     monkeypatch.setattr(
-        app_module, "settings", Settings(default_language="it", allowed_languages="it,en")
+        runtime, "settings", Settings(default_language="it", allowed_languages="it,en")
     )
     assert _resolve_language(FakeModel(), "x.wav", "en") == "en"
     assert _resolve_language(FakeModel(), "x.wav", "DE") == "de"  # case-insensitive
 
 
 def test_default_language_used_when_request_omits_it(monkeypatch):
-    monkeypatch.setattr(app_module, "settings", Settings(default_language="it"))
+    monkeypatch.setattr(runtime, "settings", Settings(default_language="it"))
     assert _resolve_language(FakeModel(), "x.wav", None) == "it"
 
 
 def test_single_allowed_language_is_forced(monkeypatch):
-    monkeypatch.setattr(app_module, "settings", Settings(allowed_languages=" it "))
+    monkeypatch.setattr(runtime, "settings", Settings(allowed_languages=" it "))
     assert _resolve_language(FakeModel(), "x.wav", None) == "it"
     # even though detector would say en, the single-code allowlist wins
     model = FakeModel(detect_scores=[("en", 0.9)])
@@ -135,11 +134,11 @@ def test_multi_allowlist_constrains_detection(wav_path):
     model = FakeModel(
         detect_scores=[("de", 0.9), ("it", 0.5), ("en", 0.4), ("fr", 0.05)]
     )
-    app_module.settings = Settings(allowed_languages="it,en")
+    runtime.settings = Settings(allowed_languages="it,en")
     try:
         assert _resolve_language(model, wav_path, None) == "it"
     finally:
-        app_module.settings = Settings()
+        runtime.settings = Settings()
     assert model.detect_called == 1
 
 
@@ -154,20 +153,20 @@ def test_multi_allowlist_uses_capped_prefix_decode(monkeypatch, wav_path):
             return super().detect_language(audio)
 
     monkeypatch.setattr(
-        app_module, "settings", Settings(allowed_languages="it,en")
+        runtime, "settings", Settings(allowed_languages="it,en")
     )
-    monkeypatch.setattr(app_module, "_decode_audio_prefix", lambda audio: sentinel)
+    monkeypatch.setattr(language, "_decode_audio_prefix", lambda audio, max_seconds=30.0: sentinel)
     assert _resolve_language(Model(), wav_path, None) == "en"  # best allowed
     np.testing.assert_array_equal(captured["audio"], sentinel)
 
 
 def test_multi_allowlist_no_match_returns_none(wav_path):
     model = FakeModel(detect_scores=[("de", 0.9), ("fr", 0.1)])
-    app_module.settings = Settings(allowed_languages="it,en")
+    runtime.settings = Settings(allowed_languages="it,en")
     try:
         assert _resolve_language(model, wav_path, None) is None
     finally:
-        app_module.settings = Settings()
+        runtime.settings = Settings()
 
 
 def test_decode_audio_prefix_matches_full_decode(tmp_path):
@@ -193,7 +192,7 @@ def test_decode_audio_prefix_caps_at_language_window(tmp_path):
     prefix = _decode_audio_prefix(str(p))
     assert full.size == 31 * 16000
     assert prefix is not None
-    assert prefix.size == int(app_module._LANGUAGE_DETECT_SECONDS * 16000)
+    assert prefix.size == int(language._LANGUAGE_DETECT_SECONDS * 16000)
 
 
 def test_decode_audio_prefix_returns_none_for_invalid(tmp_path):
@@ -203,37 +202,37 @@ def test_decode_audio_prefix_returns_none_for_invalid(tmp_path):
 
 
 def test_no_language_config_returns_none(monkeypatch):
-    monkeypatch.setattr(app_module, "settings", Settings())
+    monkeypatch.setattr(runtime, "settings", Settings())
     assert _resolve_language(FakeModel(), "x.wav", None) is None
 
 
 def test_requested_unsupported_language_raises_400(monkeypatch):
-    monkeypatch.setattr(app_module, "settings", Settings())
+    monkeypatch.setattr(runtime, "settings", Settings())
     with pytest.raises(Exception) as exc:
         _resolve_language(FakeModel(detect_scores=[("en", 1.0)]), "x.wav", "klingon")
     assert getattr(exc.value, "status_code", 500) == 400
 
 
 def test_bad_default_language_raises_400(monkeypatch):
-    monkeypatch.setattr(app_module, "settings", Settings(default_language="xx"))
+    monkeypatch.setattr(runtime, "settings", Settings(default_language="xx"))
     with pytest.raises(Exception) as exc:
         _resolve_language(FakeModel(), "x.wav", None)
     assert getattr(exc.value, "status_code", 500) == 400
 
 
 def test_empty_language_treated_as_absent(monkeypatch):
-    monkeypatch.setattr(app_module, "settings", Settings(default_language="it"))
+    monkeypatch.setattr(runtime, "settings", Settings(default_language="it"))
     assert _resolve_language(FakeModel(), "x.wav", "") == "it"
 
 
 def test_whitespace_language_treated_as_absent(monkeypatch):
-    monkeypatch.setattr(app_module, "settings", Settings(default_language="it"))
+    monkeypatch.setattr(runtime, "settings", Settings(default_language="it"))
     assert _resolve_language(FakeModel(), "x.wav", "   ") == "it"
 
 
 def test_mixed_whitespace_language_still_validates(monkeypatch):
     # Nested whitespace is fine; the code is trimmed, then validated.
-    monkeypatch.setattr(app_module, "settings", Settings(default_language="it"))
+    monkeypatch.setattr(runtime, "settings", Settings(default_language="it"))
     assert _resolve_language(FakeModel(), "x.wav", "  en ") == "en"
 
 
