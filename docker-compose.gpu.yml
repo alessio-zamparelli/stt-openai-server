@@ -1,0 +1,40 @@
+# GPU overlay for the local development / self-host compose file.
+#
+# Prerequisites: NVIDIA driver >= 525.60.13 (recommended >= 550) and the
+# NVIDIA Container Toolkit installed on the host. No host CUDA toolkit needed.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml logs -f stt
+#
+# The base file keeps CPU defaults; this overlay swaps in deploy/Dockerfile.gpu
+# and the CUDA device/compute type. See README "GPU image (CUDA)".
+name: stt-api
+
+services:
+  stt:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.gpu
+    image: stt-api:gpu
+    environment:
+      # CTranslate2 GPU backend. float16 is the usual accuracy/speed default;
+      # int8_float16 uses less VRAM, bfloat16 needs Ampere or newer.
+      - STT_DEVICE=cuda
+      - STT_COMPUTE_TYPE=float16
+      # Decodes still serialize on the single model; batching is the main GPU
+      # win on long audio. Opt-in, and it changes segmentation/casing because
+      # batched mode ignores condition_on_previous_text.
+      # - STT_BATCH_SIZE=8
+      # Only batch clips at least this long (needs BATCH_SIZE).
+      # - STT_BATCH_MIN_SECONDS=30
+      # Larger models become practical on GPU: tiny | base | small | medium |
+      # large-v3 | large-v3-turbo (fp16 large-v3 needs roughly 5 GB VRAM).
+      # - STT_MODEL_NAME=large-v3
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

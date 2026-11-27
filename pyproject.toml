@@ -15,6 +15,17 @@ dependencies = [
     "zeroconf>=0.132.0",
 ]
 
+[project.optional-dependencies]
+# CUDA 12 user-space libraries for CTranslate2's GPU backend. Installed only by
+# the GPU image (deploy/Dockerfile.gpu, `uv sync --extra gpu`); the default CPU
+# image must stay CUDA-free. CTranslate2 4.8.2 is built against CUDA 12.4 and
+# loads cuBLAS at runtime; cuDNN became optional in CT2 4.6.3 (conv1d is now
+# pure CUDA), so the wheel links no cuDNN at all. Driver >= 525.60.13 is still
+# required for the CUDA 12 runtime (see README "GPU image (CUDA)").
+gpu = [
+    "nvidia-cublas-cu12; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
 [project.scripts]
 stt-api = "stt_api.main:main"
 # One-release migration aid for existing scripts; remove in the next minor.

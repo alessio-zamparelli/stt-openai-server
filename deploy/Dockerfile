@@ -15,8 +15,11 @@
 # Guide patterns applied: bind-mounted manifest files (no lockfile layer),
 # UV_COMPILE_BYTECODE, cache mounts, --no-editable, .venv via .dockerignore.
 #
-# CPU-only by design: faster-whisper runs on CTranslate2's CPU backend with
-# INT8 quantization — no CUDA/NVIDIA layers, no torch wheels.
+# This image is CPU-only: faster-whisper runs on CTranslate2's CPU backend with
+# INT8 quantization — no CUDA/NVIDIA layers, no torch wheels. The opt-in CUDA
+# variant lives in deploy/Dockerfile.gpu (see README "GPU image (CUDA)"); this
+# file must stay free of the NVIDIA wheels so the default image and tests do
+# not depend on a GPU.
 #
 # Build:    docker build -f deploy/Dockerfile -t stt-api .
 # Run:      docker run --rm -p 8080:8080 -v stt-data:/data stt-api

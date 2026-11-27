@@ -3,13 +3,15 @@
 **OpenAI-compatible speech-to-text server powered by [faster-whisper](https://github.com/SYSTRAN/faster-whisper).**
 
 `stt-api` exposes `/v1/audio/transcriptions` and `/v1/audio/translations`
-with the same request shapes OpenAI clients already use. It runs entirely on
-CPU through CTranslate2, defaults to the `base` model with INT8 quantization,
-and ships with a small production-oriented FastAPI server: bounded concurrency,
-buffered uploads, duration/size guards, optional SSE streaming, per-stage
-latency metrics, and idle model eviction.
+with the same request shapes OpenAI clients already use. It runs on CPU
+through CTranslate2 by default, defaults to the `base` model with INT8
+quantization, and ships with a small production-oriented FastAPI server: bounded
+concurrency, buffered uploads, duration/size guards, optional SSE streaming,
+per-stage latency metrics, and idle model eviction. An opt-in CUDA image
+(`deploy/Dockerfile.gpu`) runs the same server on an NVIDIA GPU.
 
-- CPU only — no CUDA, no PyTorch, no NVIDIA layers.
+- CPU by default — the default image has no CUDA, no PyTorch, no NVIDIA layers.
+  The GPU variant is a separate image and stays opt-in.
 - OpenAI-compatible transcription, translation, and model listing.
 - Optional Wyoming ASR listener for Home Assistant (with mDNS discovery).
 - One resident model per process, with optional eviction after an idle window.
@@ -45,6 +47,7 @@ latency metrics, and idle model eviction.
 - [Tuning and performance](#tuning-and-performance)
 - [Docker](#docker)
   - [Dockerfile walkthrough](#dockerfile-walkthrough)
+  - [GPU image (CUDA)](#gpu-image-cuda)
   - [docker-compose.yml walkthrough](#docker-composeyml-walkthrough)
   - [Building and running](#building-and-running)
 - [Production notes](#production-notes)
@@ -109,6 +112,10 @@ docker run --rm -p 8080:8080 -p 10300:10300 \
 Replace `<owner>` with the GitHub owner that published the image through the
 workflow in `.github/workflows/docker-publish.yml`. Drop the `10300` mapping and
 `STT_WYOMING=true` if you only need the HTTP API.
+
+The CUDA build is published to the same package with a `-cuda` suffix:
+`:latest-cuda` from `main`, and `:<version>-cuda` (e.g. `:0.2.0-cuda`) from a
+`v*.*.*` tag. Run it with `--gpus all` — see [GPU image (CUDA)](#gpu-image-cuda).
 
 ### Local with `uv`
 
@@ -542,7 +549,8 @@ client ← transcript      ({text, language})
                      └────────────────────────────────────┼──────────────────────────────┘
                                                           ▼
                                             one shared WhisperModel
-                                            CTranslate2 · CPU · INT8
+                                            CTranslate2 · CPU INT8 (default)
+                                            or CUDA FP16 (GPU image)
                                             inference serialized by _inference_lock
                                                           │
                                                           ▼
@@ -740,18 +748,20 @@ traceback while the model is still loading.
 │   ├── PLAN-robustness-concurrency.md
 │   └── PLAN-wyoming.md
 ├── deploy/
-│   └── Dockerfile                 # multi-stage CPU-only uv image
+│   ├── Dockerfile                 # multi-stage CPU-only uv image
+│   └── Dockerfile.gpu             # same image + CUDA 12 cuBLAS wheels
 ├── docker-compose.yml             # local build/run convenience
+├── docker-compose.gpu.yml         # GPU overlay (device + float16 defaults)
 ├── pyproject.toml                 # uv package + pytest config
 ├── uv.lock                        # pinned dependency graph
 ├── requirements.txt               # pip fallback
 └── .github/workflows/
-    └── docker-publish.yml         # smoke gate + GHCR publish
+    └── docker-publish.yml         # smoke gate + GHCR publish (CPU + -cuda)
 ```
 
 Docker copies `app.py` and the `stt_api/` package into the runtime image. If you
-add another runtime module or data file, update `deploy/Dockerfile` or the
-container will fail at import/startup.
+add another runtime module or data file, update both `deploy/Dockerfile` and
+`deploy/Dockerfile.gpu` or the containers will fail at import/startup.
 
 ---
 
@@ -770,8 +780,8 @@ is logged for each legacy variable.
 | Variable | Default | Description |
 | --- | --- | --- |
 | `STT_MODEL_NAME` | `base` | faster-whisper model size or local CTranslate2 model path. Tested sizes: `tiny`, `base`, `small`, `medium`, `large-v3`, `large-v3-turbo`. |
-| `STT_COMPUTE_TYPE` | `int8` | CTranslate2 compute type passed to `WhisperModel`. Common CPU values: `int8`, `int8_float32`, `int16`, `float32`. GPU-only types require GPU builds, which this image does not ship. |
-| `STT_DEVICE` | `cpu` | Device passed to faster-whisper. The project is designed for `cpu`; the image has no CUDA libraries. |
+| `STT_COMPUTE_TYPE` | `int8` | CTranslate2 compute type passed to `WhisperModel`. Common CPU values: `int8`, `int8_float32`, `int16`, `float32`. GPU values (GPU image only): `float16` (default there), `int8_float16`, `bfloat16` (Ampere+). The CPU image has no CUDA libraries, so GPU types fail there. |
+| `STT_DEVICE` | `cpu` | Device passed to faster-whisper: `cpu` (default image) or `cuda` (GPU image, `deploy/Dockerfile.gpu`). |
 | `STT_HOST` | `0.0.0.0` | uvicorn bind host. |
 | `STT_PORT` | `8080` | uvicorn bind port and healthcheck port. |
 | `STT_LAZY_LOAD` | `false` | Defer the initial model load until the first API request. The server binds immediately. |
@@ -809,6 +819,9 @@ Uncomment only what you need; values are examples.
 # STT_MODEL_NAME=base
 # STT_COMPUTE_TYPE=int8
 # STT_DEVICE=cpu
+# GPU image (deploy/Dockerfile.gpu) instead uses CUDA; these are its defaults:
+# STT_DEVICE=cuda
+# STT_COMPUTE_TYPE=float16
 # STT_HOST=0.0.0.0
 # STT_PORT=8080
 # STT_LAZY_LOAD=false
@@ -887,7 +900,9 @@ Uncomment only what you need; values are examples.
 Measurements below are from the reference host (`base`/INT8, CPU only;
 `jfk ≈ 11 s`, "long" = `jfk × 3 ≈ 33 s`). Whisper processes fixed ~30 s windows,
 so gains compound on multi-window audio. Treat the numbers as **ratios**, not
-universal constants — machine load changes absolute timings substantially.
+universal constants — machine load changes absolute timings substantially. No
+GPU benchmarks are published yet; the GPU image changes the backend, not the
+window/batching behaviour these ratios describe.
 
 ### Latency
 
@@ -1000,7 +1015,9 @@ or put it behind your monitoring proxy.
 ### Dockerfile walkthrough
 
 `deploy/Dockerfile` is a two-stage, CPU-only image following the
-[uv Docker guide](https://docs.astral.sh/uv/guides/integration/docker/).
+[uv Docker guide](https://docs.astral.sh/uv/guides/integration/docker/). The
+opt-in GPU variant (`deploy/Dockerfile.gpu`) mirrors it and is described in
+[GPU image (CUDA)](#gpu-image-cuda); the CPU image never installs CUDA.
 
 #### Stage 1 — builder
 
@@ -1084,6 +1101,88 @@ Runtime details:
 No `ffmpeg` is installed: decoding uses PyAV's bundled libraries, and there is
 no compressed-output encoder in this server.
 
+### GPU image (CUDA)
+
+`deploy/Dockerfile.gpu` builds the same server with CTranslate2's CUDA backend.
+It is a separate image on purpose: the CPU image must stay free of CUDA
+libraries, and the NVIDIA wheels add roughly 1 GB (cuBLAS + NVRTC).
+
+**Host prerequisites** (the container ships the CUDA user-space libraries, so
+the host needs no CUDA toolkit):
+
+- NVIDIA driver **≥ 525.60.13** (the CUDA 12.x floor; the R535 branch works via
+  minor-version compatibility); **≥ 550** recommended. `nvidia-smi` may report
+  `CUDA Version: 12.x` or newer (e.g. 13.x): drivers are backward compatible
+  with CUDA 12 user-space libraries.
+- [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+  so `--gpus all` (or the Compose device reservation) works.
+
+Keep the `cu12` wheel family even on a CUDA 13 driver: CTranslate2 4.8.2 is
+built against CUDA 12.4 and `dlopen`s `libcublas.so.12`. Installing
+`nvidia-cublas-cu13` would provide a different soname and would not be found.
+
+Running the GPU image **without** a visible GPU fails at startup (the eager
+model load happens before uvicorn binds); with `STT_LAZY_LOAD=true` it fails on
+the first transcription instead.
+
+**Build and run:**
+
+```bash
+docker build -f deploy/Dockerfile.gpu -t stt-api:gpu .
+
+docker run --rm --gpus all -p 8080:8080 -v stt-data:/data stt-api:gpu
+
+# or, with the overlay (keeps the base compose file CPU-default):
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+```
+
+The publish workflow pushes this image to the same GHCR package as the CPU
+image, suffixed with `-cuda`: `<version>-cuda` and `<major>.<minor>-cuda` on
+`v*.*.*` tag pushes, `latest-cuda` on `main`.
+
+**What the image adds:**
+
+- `uv sync --extra gpu` pulls `nvidia-cublas-cu12` (declared in
+  `pyproject.toml` under `[project.optional-dependencies]`; it brings
+  `nvidia-cuda-nvrtc-cu12` with it). The dependency is linux/x86-64-only and is
+  not installed into the CPU image.
+- **No cuDNN.** CTranslate2 4.8.2 is built against CUDA 12.4 and loads cuBLAS at
+  runtime; since 4.6.3, cuDNN is optional (conv1d has a pure CUDA
+  implementation) and the wheel links no cuDNN at all. `nvidia-cudnn-cu12` is
+  therefore deliberately absent — it would add ~1.7 GB for nothing.
+- `ldconfig` is pointed at every `site-packages/nvidia/*/lib` directory, because
+  CTranslate2 `dlopen`s `libcublas.so.12` / `libcublasLt.so.12` from there. The
+  build fails early if those sonames or `libctranslate2`'s `NEEDED` libraries
+  cannot be resolved.
+- Defaults are `STT_DEVICE=cuda` and `STT_COMPUTE_TYPE=float16`; the app code is
+  unchanged. `docker-compose.gpu.yml` reserves one NVIDIA device and sets the
+  same values explicitly.
+
+**Tuning on GPU:**
+
+| Compute type | Notes |
+| --- | --- |
+| `float16` | Default. Best accuracy/speed balance on Turing and newer (and on Volta/Pascal datacenter cards). |
+| `int8_float16` | Less VRAM, slightly lower accuracy; useful for `large-v3` on smaller cards. |
+| `bfloat16` | Ampere (sm_80) or newer only. |
+| `int8`, `float32` | Work on GPU but are slower / larger than `float16`; leave them to the CPU image. |
+
+- **Decodes still serialize** on the single shared model (`_inference_lock`);
+  `STT_MAX_CONCURRENT` bounds the queue, not parallel GPU work. The big GPU win
+  is `STT_BATCH_SIZE`, which batches Whisper's ~30 s windows (opt-in, and it
+  changes casing/segmentation like on CPU). `STT_CPU_THREADS` is inert under
+  CTranslate2's CUDA backend.
+- **VRAM** is roughly 1 GB for `base`/`small` FP16 and ~5 GB for `large-v3`
+  FP16 (activations and batching included); `int8_float16` cuts that further.
+  Idle eviction still works, but it frees VRAM only when the model object is
+  collected — verify with `nvidia-smi` if you rely on it.
+- **One model per GPU.** The server does not shard across devices; run one
+  container per GPU (pin with `NVIDIA_VISIBLE_DEVICES`/Compose `device_ids`) or
+  prefer a single larger instance.
+- **CPU image unaffected.** `uv sync --locked ... --no-dev` without
+  `--extra gpu` installs none of the NVIDIA wheels, so the CPU image size,
+  startup, and tests are unchanged.
+
 ### `docker-compose.yml` walkthrough
 
 ```yaml
@@ -1144,17 +1243,26 @@ at a time**, and remember that `STT_TEMPERATURES` overrides per-request
 ### Building and running
 
 ```bash
-# Build locally
+# Build locally (CPU)
 docker build -f deploy/Dockerfile -t stt-api .
+
+# Build the GPU variant
+docker build -f deploy/Dockerfile.gpu -t stt-api:gpu .
 
 # Run with a persistent cache
 docker run --rm -p 8080:8080 -p 10300:10300 -e STT_WYOMING=true \
   -v stt-data:/data stt-api
 
-# Compose
+# Run on GPU
+docker run --rm --gpus all -p 8080:8080 -v stt-data:/data stt-api:gpu
+
+# Compose (CPU)
 docker compose up -d --build
 docker compose logs -f stt
 docker compose down
+
+# Compose (GPU overlay)
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
 
 # Rebuild after dependency changes
 uv lock --upgrade
@@ -1163,7 +1271,8 @@ docker compose up -d
 ```
 
 There are no Docker build args in this project. Model selection and all runtime
-knobs are environment variables.
+knobs are environment variables; the GPU variant is selected by Dockerfile, not
+by a build argument.
 
 ---
 
@@ -1173,6 +1282,12 @@ knobs are environment variables.
   roughly 450–500 MB while active; inference is serialized. Several containers
   on one box cause cold-start and queue contention. Prefer fewer, larger
   instances, or batched mode for long-file workloads.
+- **GPU deployments.** Use `deploy/Dockerfile.gpu` (or the
+  `docker-compose.gpu.yml` overlay) with driver ≥ 550 and the NVIDIA Container
+  Toolkit. One container per GPU; size `STT_MODEL_NAME` to the card's VRAM
+  (`large-v3` FP16 needs ~5 GB) and prefer `STT_BATCH_SIZE` over extra
+  containers for throughput. `/health` does not report the device, so confirm
+  `cuda` in the startup log.
 - **Model cache.** Always mount `/data`. It is the difference between a ~0.5 s
   warm reload and a full download.
 - **Healthcheck.** The built-in probe honors `STT_PORT`, bypasses proxies,
@@ -1184,7 +1299,7 @@ knobs are environment variables.
 - **Scaling.** Scale horizontally behind a reverse proxy
   (`docker compose --scale stt=N`) only if you have CPU capacity for N
   models. Sticky sessions are not required; every instance serves the same
-  configured model.
+  configured model. On GPU, one container per device instead of N per host.
 - **Security.** There is no built-in auth or rate limiting. Put Traefik
   forward-auth, nginx, or an API gateway in front for public deployments. The
   server also returns exception strings in `500` details and exposes
@@ -1197,8 +1312,8 @@ knobs are environment variables.
   failures.
 - **Offline/air-gapped.** Pre-populate `/data/hf`, set `STT_HF_OFFLINE=true`
   and `HF_HUB_OFFLINE=1`, and verify the model loads without network access.
-- **Provenance.** The publish workflow attaches SLSA build attestations to the
-  GHCR image.
+- **Provenance.** The publish workflow attaches SLSA build attestations to both
+  the CPU and `-cuda` GHCR images.
 
 ---
 
@@ -1271,20 +1386,27 @@ not need per-knob documentation.
 - `.dockerignore` keeps `.venv`, `.git`, tests, compose, and caches out of the
   build context.
 - `.github/workflows/docker-publish.yml` runs an import/OpenAPI smoke test, then
-  builds and pushes to GHCR on pushes to `main` and `v*.*.*` tags. There is **no
-  unit/e2e test job and no PR trigger**; run the suites locally before pushing.
+  builds and pushes **both** images to GHCR on pushes to `main` and `v*.*.*`
+  tags: the CPU image (`latest`, `<version>`) and the CUDA image
+  (`latest-cuda`, `<version>-cuda`). There is **no unit/e2e test job, no GPU
+  inference test, and no PR trigger**; run the suites locally before pushing.
 - The workflow publishes `linux/amd64` only, with GHA cache and SLSA
   attestations. Docker copies `app.py` + `stt_api/`, so adding a runtime module
-  requires updating `deploy/Dockerfile`.
+  requires updating both Dockerfiles.
 
 ---
 
 ## Limitations
 
 - **Serialized inference.** One shared model and one decode at a time. More
-  concurrency means more queueing, not more parallel transcription.
-- **CPU focus.** The image has no CUDA/torch; GPU compute types are unsupported
-  unless you build a custom image and add the relevant libraries.
+  concurrency means more queueing, not more parallel transcription. This holds
+  on GPU too; use `STT_BATCH_SIZE` for throughput on long audio.
+- **GPU support is a separate image.** `deploy/Dockerfile.gpu` adds the CUDA 12
+  runtime (cuBLAS; no cuDNN is needed by this CTranslate2 build) and requires
+  host driver ≥ 525.60.13 (recommended ≥ 550); the default image has no
+  CUDA/torch and cannot run GPU compute types. `/health` reports
+  `compute_type` but not `device`, so check the startup log to confirm the
+  backend.
 - **No built-in auth/rate limiting.** Use a proxy.
 - **Wyoming has no auth/encryption either.** Keep port `10300` on a trusted
   network; it is meant for Home Assistant, not the public internet.
@@ -1296,8 +1418,8 @@ not need per-knob documentation.
   the wait; the worker keeps running until the decode finishes.
 - **Duration probing is best-effort.** If PyAV cannot determine container
   duration, the duration guard is skipped rather than rejecting valid audio.
-- **Package layout.** The Dockerfile copies `app.py` and `stt_api/`; adding
-  another runtime package requires Dockerfile changes.
+- **Package layout.** Both Dockerfiles copy `app.py` and `stt_api/`; adding
+  another runtime package requires updating both.
 - **No model hot-swap.** The served model is fixed at process start by
   `STT_MODEL_NAME`.
 

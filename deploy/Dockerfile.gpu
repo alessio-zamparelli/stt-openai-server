@@ -1,0 +1,108 @@
+# syntax=docker/dockerfile:1
+#
+# stt-api — OpenAI-compatible speech-to-text server (CUDA image).
+#
+# Same two-stage uv build as deploy/Dockerfile, plus the CUDA 12 user-space
+# libraries CTranslate2 needs for GPU execution. The CPU image stays CUDA-free;
+# this file is the opt-in GPU variant.
+#
+# The Python wheels ship cuBLAS (and its NVRTC dependency) inside the venv; no
+# host CUDA toolkit is required. CTranslate2 4.8.2 is built against CUDA 12.4
+# and loads cuBLAS at runtime; it does not link cuDNN (optional since 4.6.3,
+# conv1d is pure CUDA), so there is no cuDNN dependency to install.
+# The host only needs an NVIDIA driver >= 525.60.13 (practically >= 550) and
+# the NVIDIA Container Toolkit. See README "GPU image (CUDA)".
+#
+# Build:    docker build -f deploy/Dockerfile.gpu -t stt-api:gpu .
+# Run:      docker run --rm --gpus all -p 8080:8080 -v stt-data:/data stt-api:gpu
+# Compose:  docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+#
+# The first startup downloads the base model (~140 MB) into /data/hf. Mount
+# /data as a volume so weights persist across restarts.
+
+###############################################################################
+# Stage 1 — builder: resolve locked dependencies into a venv (with GPU extras)
+###############################################################################
+FROM python:3.14-slim AS builder
+
+# Pin uv to the exact version used to (re)generate uv.lock.
+COPY --from=ghcr.io/astral-sh/uv:0.13.1 /uv /uvx /bin/
+
+# Use the system Python already present in the slim image (3.14).
+ENV UV_PYTHON_DOWNLOADS=0 \
+    UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1
+
+WORKDIR /app
+
+# Layer 1 — install ALL locked dependencies without the project, including the
+# `gpu` extra (nvidia-cublas-cu12). Manifest files are bind-mounted per the uv
+# guide's canonical pattern: they never enter an image layer, and this RUN's
+# cache invalidates only when they change.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    --mount=type=bind,source=uv.lock,target=uv.lock \
+    uv sync --locked --no-install-project --no-dev --no-editable --extra gpu
+
+###############################################################################
+# Stage 2 — runtime: CUDA libraries on the loader path, non-root, /data volume
+###############################################################################
+FROM python:3.14-slim AS runtime
+
+# libgomp1 is still used by CTranslate2's CPU-side ops; ca-certificates are for
+# the initial Hugging Face download.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libgomp1 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Reuse the system Python across stages; put the app venv on PATH.
+ENV PATH="/app/.venv/bin:$PATH" \
+    UV_PYTHON_DOWNLOADS=0 \
+    PYTHONUNBUFFERED=1 \
+    STT_HOST=0.0.0.0 \
+    STT_PORT=8080 \
+    STT_MODEL_NAME=base \
+    STT_COMPUTE_TYPE=float16 \
+    STT_DEVICE=cuda \
+    HF_HOME=/data/hf \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+WORKDIR /app
+COPY --from=builder /app/.venv /app/.venv
+COPY app.py ./
+COPY stt_api ./stt_api
+
+# The pip wheels install their shared objects under site-packages/nvidia/*/lib,
+# which the dynamic loader does not search by default. Register every such
+# directory with ldconfig (robust to Python-version and wheel-layout changes),
+# confirm the CUDA sonames are visible, and smoke-test the Python extension.
+# CTranslate2 dlopen()s cuBLAS at runtime, so build-time ldd cannot see it;
+# the ldconfig greps are what guard against a silently broken loader path.
+RUN for d in /app/.venv/lib/python*/site-packages/nvidia/*/lib; do \
+        [ -d "$d" ] && echo "$d"; \
+    done > /etc/ld.so.conf.d/nvidia.conf \
+    && ldconfig \
+    && ldconfig -p | grep -q 'libcublas\.so\.12' \
+    && ldconfig -p | grep -q 'libcublasLt\.so\.12' \
+    && /app/.venv/bin/python -c \
+        "import ctranslate2; print('ctranslate2', ctranslate2.__version__)"
+
+# Non-root runtime user; /data must stay writable for downloaded model weights.
+RUN useradd --create-home --uid 10001 stt \
+    && mkdir -p /data/hf \
+    && chown -R stt:stt /data
+
+# Persistent volume: HF model weights (HF_HOME=/data/hf). Mount it to avoid
+# re-downloading the model on every container restart.
+VOLUME ["/data"]
+
+USER stt
+EXPOSE 8080 10300
+
+# Same cold-start allowance as the CPU image: the eager model load (and first
+# weight download) happens inside the FastAPI lifespan before uvicorn binds.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=600s --retries=3 \
+    CMD ["python", "app.py", "--healthcheck"]
+
+ENTRYPOINT ["python", "app.py"]

@@ -20,8 +20,11 @@
 - `stt_api/config.py` defines `Settings`, `load_settings()`, and env resolution.
 - `app.py` only re-exports `app`/`run` so `python app.py` and
   `python app.py --healthcheck` keep working. Do not put application logic there.
-- CPU-only by design: faster-whisper + CTranslate2, default `base` / `int8`.
-  Do not add GPU/torch paths.
+- CPU by default, GPU opt-in: faster-whisper + CTranslate2, default `base` /
+  `int8` on the CPU image. The CUDA path lives only in `deploy/Dockerfile.gpu`
+  (the `gpu` extra in `pyproject.toml`), driven by `STT_DEVICE` /
+  `STT_COMPUTE_TYPE`. Keep the default image and the default settings
+  CUDA-free; do not add torch.
 - `README.md` is the user-facing API/env reference; `docs/PLAN-*.md` hold design
   rationale and measured performance/robustness numbers.
 
@@ -50,6 +53,12 @@ uv run python -c "import stt_api.main"  # import smoke check (no model load)
 - Docker: `docker compose up -d --build`, or
   `docker build -f deploy/Dockerfile -t stt-api .`. The first startup downloads
   weights into `/data/hf`.
+- GPU (opt-in): `deploy/Dockerfile.gpu` +
+  `docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build`,
+  or `docker build -f deploy/Dockerfile.gpu -t stt-api:gpu .` then
+  `docker run --rm --gpus all -p 8080:8080 -v stt-data:/data stt-api:gpu`.
+  Requires host driver >= 525.60.13 (recommended >= 550 for the CUDA 12.x
+  runtime) and the NVIDIA Container Toolkit; no host CUDA toolkit needed.
 
 ## Tests — use `python -m pytest`
 
@@ -124,13 +133,22 @@ uv run python -m pytest tests/test_tuning.py::test_route_forwards_beam_and_sched
 
 - The runtime image copies **`app.py` and `stt_api/`** and runs
   `uv sync --locked --no-install-project`. If you add runtime modules or data
-  files outside `stt_api/`, update `deploy/Dockerfile` or the image will fail at
-  startup.
-- Docker pins uv `0.13.1` and Python `3.14`; a different local uv may be in use.
-  If dependencies change, regenerate `uv.lock` intentionally (`uv lock` /
+  files outside `stt_api/`, update both `deploy/Dockerfile` and
+  `deploy/Dockerfile.gpu` or the images will fail at startup.
+- GPU support lives only in `deploy/Dockerfile.gpu` via the `gpu` extra
+  (`nvidia-cublas-cu12`; CT2 4.8.2 links no cuDNN), registered with `ldconfig`
+  from `site-packages/nvidia/*/lib`. Keep the CPU image (`--no-dev`, no
+  `--extra gpu`) CUDA-free and do not add torch. The GPU image defaults to
+  `STT_DEVICE=cuda` / `STT_COMPUTE_TYPE=float16`.
+- Docker pins uv `0.13.1` and Python `3.14`; a different local uv may be in use
+  (this repo's lockfile was last touched with a 0.12.x build, which 0.13.1 reads
+  fine). If dependencies change, regenerate `uv.lock` intentionally (`uv lock` /
   `uv lock --upgrade`) and keep the Dockerfile's uv pin compatible, otherwise
   `--locked` builds can fail. `.dockerignore` excludes tests and the local
   `.venv`.
 - `.github/workflows/docker-publish.yml` runs only an import/OpenAPI smoke test,
-  then publishes to GHCR on pushes to `main` and `v*.*.*` tags. There is no test
-  job and no PR trigger, so run the unit/e2e suites locally before pushing.
+  then builds and pushes both images on pushes to `main` and `v*.*.*` tags:
+  CPU (`latest`, `<version>`) and CUDA (`latest-cuda`, `<version>-cuda`).
+  GitHub-hosted runners have no GPU, so the CUDA job is build/push only — no
+  GPU inference test. There is no test job and no PR trigger, so run the
+  unit/e2e suites locally before pushing.

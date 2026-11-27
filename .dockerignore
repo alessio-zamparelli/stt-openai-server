@@ -13,5 +13,6 @@ __pycache__/
 .DS_Store
 tests/
 docker-compose.yml
+docker-compose.gpu.yml
 pyrightconfig.json
 .env
